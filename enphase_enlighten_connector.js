@@ -1,17 +1,23 @@
-// ioBroker Script: Enphase Battery Control (Session-basierter Login)
-// JavaScript-Konvertierung von: https://github.com/chinedu40/hacs_enphase_envoy_cloud
+// ioBroker Script: Enphase Battery Control via Enlighten Cloud API
+// Converted from: https://github.com/chinedu40/hacs_enphase_envoy_cloud
 //
-// Dieses Script meldet sich per Email/Passwort bei enlighten.enphaseenergy.com an
-// und steuert Batterieeinstellungen über die interne Cloud-API.
+// Authenticates with email/password at enlighten.enphaseenergy.com and
+// controls battery settings (discharge restrict, charge-from-grid, schedules)
+// through the internal Enphase cloud REST API.
 //
-// Enthält: login, getCsrfToken, getJwtToken, updateToken, checkToken,
-//          changeBatteryDischargeSwitch ("Batterieentladung einschränken")
+// Includes: login, getCsrfToken, getJwtToken, updateToken, checkToken,
+//           changeBatteryDischargeSwitch, readBatteryDischargeStatus,
+//           readChargeFromGrid, changeChargeFromGrid,
+//           readDischargeSchedules, restoreDischargeSchedules,
+//           readChargeSchedules, restoreChargeSchedules,
+//           deleteDischargeSchedules, deleteChargeSchedules,
+//           getMqttSignedUrl, changeBatteryViaMqtt
 //
-// Bugfixes gegenüber Vorversion:
-//  - login() wird beim Start korrekt mit await aufgerufen (Async-IIFE)
-//  - Login-POST verwendet redirect:'manual' damit 302-Cookies nicht verloren gehen
-//  - updateToken() loggt Response-Body bei Fehler
-//  - Überflüssiger standalone-Aufruf von checkToken() entfernt
+// Fix history:
+//  - login() is correctly called with await inside an async IIFE on startup
+//  - Login POST uses redirect:'manual' so 302-cookies are not lost
+//  - updateToken() logs response body on error
+//  - Redundant standalone call to checkToken() removed
 
 'use strict';
 
@@ -20,31 +26,31 @@ const fs    = require('fs');
 const path  = require('path');
 const { URLSearchParams } = require('url');
 
-// --- Modulprüfung ---
+// --- Module check ---
 if (typeof fetch !== 'function') {
-   log('Module node-fetch ist nicht als Funktion geladen - Script gestoppt', 'error');
+   log('Module node-fetch is not loaded as a function - script stopped', 'error');
    stopScript();
    return;
 }
 
 // -------------------------------------------------------------------------------------------------------------------
-// Konfiguration :: Bitte anpassen
+// Configuration -- please adjust
 // -------------------------------------------------------------------------------------------------------------------
-let debug = 1; // Debug-Level (0=minimal, 1=info, 2=erweitert, 3=vollständig)
+let debug = 0; // Debug level (0=minimal, 1=info, 2=extended, 3=full)
 
 const ENLIGHTEN_BASE  = 'https://enlighten.enphaseenergy.com';
 const BATTERY_UI_BASE = 'https://battery-profile-ui.enphaseenergy.com';
 
-// Automatische Wiederherstellung nach Aktivierung des RBD-Schalters?
-// true = restoreDischargeSchedules() wird nach changeBatteryDischargeSwitch(true) aufgerufen
+// Automatically restore discharge schedules after enabling the RBD switch?
+// true = restoreDischargeSchedules() is called after changeBatteryDischargeSwitch(true)
 const AUTO_RESTORE_SCHEDULES = true;
 
-// maxDischargeSchedules / maxChargeSchedules und restoreDelayMs werden aus ioBroker-Config-Datenpunkten gelesen (siehe unten)
-let maxDischargeSchedules = 1;     // Standardwert – wird nach DP-Anlage überschrieben
-let maxChargeSchedules    = 1;     // Standardwert – wird nach DP-Anlage überschrieben
-let restoreDelayMs        = 15000; // Standardwert – wird nach DP-Anlage überschrieben
+// maxDischargeSchedules / maxChargeSchedules and restoreDelayMs are read from ioBroker config datapoints (see below)
+let maxDischargeSchedules = 1;     // Default -- overwritten after datapoint creation
+let maxChargeSchedules    = 1;     // Default -- overwritten after datapoint creation
+let restoreDelayMs        = 15000; // Default -- overwritten after datapoint creation
 
-// ioBroker Datenpfade
+// ioBroker datapoint paths
 const dpBase    = '0_userdata.0.enphase.battery.';
 const dpConfig  = dpBase + 'config.';
 const dpStatus  = dpBase + 'status.';
@@ -52,11 +58,11 @@ const dpControl = dpBase + 'control.';
 const dpSchedD  = dpBase + 'schedules.discharge.';
 const dpSchedC  = dpBase + 'schedules.charge.';
 
-// Cache-Datei für Token-Persistenz (Pfad anpassen falls nötig)
+// Cache file for token persistence (adjust path if necessary)
 const CACHE_FILE = path.join('/opt/iobroker/iobroker-data', 'enphase_battery_auth.json');
 
 // -------------------------------------------------------------------------------------------------------------------
-// Datenpunkte anlegen
+// Datapoint creation
 // -------------------------------------------------------------------------------------------------------------------
 async function ensureStateAsync(id, value, options = { read: true, write: true }) {
    if (!existsState(id)) {
@@ -76,76 +82,76 @@ await ensureStateAsync(dpControl + 'battery_discharge_restrict',false,  { type: 
 await ensureStateAsync(dpControl + 'read_battery_status',        false,  { type: 'boolean', role: 'button',     read: true,  write: true  });
 await ensureStateAsync(dpStatus  + 'battery_discharge_cloud',    false,  { type: 'boolean', role: 'indicator',  read: true,  write: false });
 await ensureStateAsync(dpControl + 'read_charge_from_grid_status', false, { type: 'boolean', role: 'button',    read: true, write: true,
-   desc: 'Netzlade-Status manuell von Enphase Cloud abrufen' });
+   desc: 'Manually fetch grid-charge status from Enphase cloud' });
 await ensureStateAsync(dpControl + 'battery_charge_from_grid_enable',           false,   { type: 'boolean', role: 'switch',    read: true, write: true,
-   desc: 'Batterieladen über Stromnetz aktivieren/deaktivieren' });
+   desc: 'Enable/disable charging the battery from the grid' });
 await ensureStateAsync(dpStatus  + 'charge_from_grid_cloud',     false,   { type: 'boolean', role: 'indicator', read: true, write: false,
-   desc: 'Aktueller Cloud-Status: Netzladen' });
+   desc: 'Current cloud status: charge from grid' });
 
 await ensureStateAsync(dpStatus  + 'battery_grid_mode',          '',      { type: 'string',  role: 'text',      read: true, write: false,
-   desc: 'Aktueller batteryGridMode' });
+   desc: 'Current batteryGridMode' });
 
-// Zeitplan-Konfiguration aus ioBroker (Werte werden bei Skriptstart ausgelesen)
+// Schedule configuration from ioBroker (values are read at script startup)
 await ensureStateAsync(dpConfig + 'max_discharge_schedules', 1,     { type: 'number', role: 'value', read: true, write: true,
-   desc: 'Max. Anzahl Entlade-Zeitpläne im ioBroker (Skript neu starten nach Änderung!)' });
+   desc: 'Max number of discharge schedules in ioBroker (restart script after changing)' });
 await ensureStateAsync(dpConfig + 'max_charge_schedules',    1,     { type: 'number', role: 'value', read: true, write: true,
-   desc: 'Max. Anzahl Lade-Zeitpläne im ioBroker (Skript neu starten nach Änderung!)' });
+   desc: 'Max number of charge schedules in ioBroker (restart script after changing)' });
 await ensureStateAsync(dpConfig + 'restore_delay_ms',        15000, { type: 'number', role: 'value', read: true, write: true,
-   desc: 'Wartezeit in ms vor Zeitplan-Wiederherstellung nach Aktivierung' });
+   desc: 'Delay in ms before schedule restore after switch activation' });
 
-// Konfigurationswerte aus ioBroker auslesen
+// Read configuration values from ioBroker
 maxDischargeSchedules = Number(getState(dpConfig + 'max_discharge_schedules').val) || 1;
 maxChargeSchedules    = Number(getState(dpConfig + 'max_charge_schedules').val)    || 1;
 restoreDelayMs        = Number(getState(dpConfig + 'restore_delay_ms').val)        || 15000;
 if (debug >= 1) log(`[Init] Config: max_discharge=${maxDischargeSchedules}, max_charge=${maxChargeSchedules}, restore_delay=${restoreDelayMs}ms`, 'info');
 
-// Zeitplan-Steuerung (Entladung)
+// Schedule control (discharge)
 await ensureStateAsync(dpControl + 'read_discharge_schedules',    false, { type: 'boolean', role: 'button', read: true, write: true });
 await ensureStateAsync(dpControl + 'restore_discharge_schedules', false, { type: 'boolean', role: 'button', read: true, write: true });
 
-// Zeitplan-Steuerung (Ladung)
+// Schedule control (charge)
 await ensureStateAsync(dpControl + 'read_charge_schedules',       false, { type: 'boolean', role: 'button', read: true, write: true });
 await ensureStateAsync(dpControl + 'restore_charge_schedules',    false, { type: 'boolean', role: 'button', read: true, write: true });
 await ensureStateAsync(dpControl + 'delete_charge_schedules',     false, { type: 'boolean', role: 'button', read: true, write: true,
-   desc: 'Alle Lade-Zeitpläne in der Enphase Cloud löschen (Soft-Delete)' });
+   desc: 'Delete all charge schedules in Enphase cloud (soft-delete)' });
 
-// Zeitplan-Löschung (Entladung)
+// Schedule deletion (discharge)
 await ensureStateAsync(dpControl + 'delete_discharge_schedules',  false, { type: 'boolean', role: 'button', read: true, write: true,
-   desc: 'Alle Entlade-Zeitpläne in der Enphase Cloud löschen (Soft-Delete)' });
+   desc: 'Delete all discharge schedules in Enphase cloud (soft-delete)' });
 
-// Entlade-Zeitplan-Status (schedules.discharge.*)
+// Discharge schedule status (schedules.discharge.*)
 await ensureStateAsync(dpSchedD + 'count',    0,  { type: 'number', role: 'value', read: true, write: true,
-   desc: 'Anzahl gespeicherter Entlade-Zeitpläne' });
+   desc: 'Number of stored discharge schedules' });
 await ensureStateAsync(dpSchedD + 'raw_json', '', { type: 'string', role: 'json',  read: true, write: true,
-   desc: 'Alle Entlade-Zeitpläne als JSON-Array' });
+   desc: 'All discharge schedules as JSON array' });
 for (let i = 0; i < maxDischargeSchedules; i++) {
    await ensureStateAsync(dpSchedD + `${i}_json`,      '', { type: 'string',  role: 'json',  read: true, write: true });
-   await ensureStateAsync(dpSchedD + `${i}_startTime`, '', { type: 'string',  role: 'text',  read: true, write: true, desc: 'Startzeit als HH:MM (z.B. "00:05")' });
-   await ensureStateAsync(dpSchedD + `${i}_endTime`,   '', { type: 'string',  role: 'text',  read: true, write: true, desc: 'Endzeit als HH:MM (z.B. "00:10")' });
+   await ensureStateAsync(dpSchedD + `${i}_startTime`, '', { type: 'string',  role: 'text',  read: true, write: true, desc: 'Start time as HH:MM (e.g. "00:05")' });
+   await ensureStateAsync(dpSchedD + `${i}_endTime`,   '', { type: 'string',  role: 'text',  read: true, write: true, desc: 'End time as HH:MM (e.g. "00:10")' });
    await ensureStateAsync(dpSchedD + `${i}_timezone`,  '', { type: 'string',  role: 'text',  read: true, write: true });
-   await ensureStateAsync(dpSchedD + `${i}_days`,      '', { type: 'string',  role: 'json',  read: true, write: true, desc: 'Wochentage als JSON-Array [1=Mo..7=So]' });
-   await ensureStateAsync(dpSchedD + `${i}_enabled`, true, { type: 'boolean', role: 'indicator', read: true, write: true, desc: 'Zeitplan aktiv (isEnabled)' });
+   await ensureStateAsync(dpSchedD + `${i}_days`,      '', { type: 'string',  role: 'json',  read: true, write: true, desc: 'Days of week as JSON array [1=Mon..7=Sun]' });
+   await ensureStateAsync(dpSchedD + `${i}_enabled`, true, { type: 'boolean', role: 'indicator', read: true, write: true, desc: 'Schedule active (isEnabled)' });
 }
 
-// Lade-Zeitplan-Status (schedules.charge.*)
+// Charge schedule status (schedules.charge.*)
 await ensureStateAsync(dpSchedC + 'count',    0,  { type: 'number', role: 'value', read: true, write: true,
-   desc: 'Anzahl gespeicherter Lade-Zeitpläne' });
+   desc: 'Number of stored charge schedules' });
 await ensureStateAsync(dpSchedC + 'raw_json', '', { type: 'string', role: 'json',  read: true, write: true,
-   desc: 'Alle Lade-Zeitpläne als JSON-Array' });
+   desc: 'All charge schedules as JSON array' });
 for (let i = 0; i < maxChargeSchedules; i++) {
    await ensureStateAsync(dpSchedC + `${i}_json`,      '', { type: 'string',  role: 'json',  read: true, write: true });
-   await ensureStateAsync(dpSchedC + `${i}_startTime`, '', { type: 'string',  role: 'text',  read: true, write: true, desc: 'Startzeit als HH:MM (z.B. "22:00")' });
-   await ensureStateAsync(dpSchedC + `${i}_endTime`,   '', { type: 'string',  role: 'text',  read: true, write: true, desc: 'Endzeit als HH:MM (z.B. "06:00")' });
+   await ensureStateAsync(dpSchedC + `${i}_startTime`, '', { type: 'string',  role: 'text',  read: true, write: true, desc: 'Start time as HH:MM (e.g. "22:00")' });
+   await ensureStateAsync(dpSchedC + `${i}_endTime`,   '', { type: 'string',  role: 'text',  read: true, write: true, desc: 'End time as HH:MM (e.g. "06:00")' });
    await ensureStateAsync(dpSchedC + `${i}_timezone`,  '', { type: 'string',  role: 'text',  read: true, write: true });
-   await ensureStateAsync(dpSchedC + `${i}_days`,      '', { type: 'string',  role: 'json',  read: true, write: true, desc: 'Wochentage als JSON-Array [1=Mo..7=So]' });
-   await ensureStateAsync(dpSchedC + `${i}_limit`,    100, { type: 'number',  role: 'value', read: true, write: true, desc: 'Ladelimit in % (0–100), z.B. 100 = vollständig laden' });
-   await ensureStateAsync(dpSchedC + `${i}_enabled`, true, { type: 'boolean', role: 'indicator', read: true, write: true, desc: 'Zeitplan aktiv (isEnabled)' });
+   await ensureStateAsync(dpSchedC + `${i}_days`,      '', { type: 'string',  role: 'json',  read: true, write: true, desc: 'Days of week as JSON array [1=Mon..7=Sun]' });
+   await ensureStateAsync(dpSchedC + `${i}_limit`,    100, { type: 'number',  role: 'value', read: true, write: true, desc: 'Charge limit in % (0-100), e.g. 100 = fully charge' });
+   await ensureStateAsync(dpSchedC + `${i}_enabled`, true, { type: 'boolean', role: 'indicator', read: true, write: true, desc: 'Schedule active (isEnabled)' });
 }
 
-if (debug >= 1) log('[Init] Datenpunkte geprüft/angelegt', 'info');
+if (debug >= 1) log('[Init] Datapoints verified/created', 'info');
 
 // -------------------------------------------------------------------------------------------------------------------
-// Cookie-Jar: verwaltet alle Session-Cookies über mehrere HTTP-Requests
+// CookieJar: manages all session cookies across multiple HTTP requests
 // -------------------------------------------------------------------------------------------------------------------
 class CookieJar {
    constructor() {
@@ -153,9 +159,9 @@ class CookieJar {
    }
 
    /**
-    * Parst Set-Cookie Header(s) und speichert Cookies.
-    * Kompatibel mit node-fetch v2 (headers.raw()) und v3 (getSetCookie()).
-    * @param {string|string[]} setCookieHeaders
+    * Parses Set-Cookie header(s) and stores the cookies.
+    * Compatible with node-fetch v2 (headers.raw()) and v3 (getSetCookie()).
+    * @param {string|string[]} setCookieHeaders - One or more Set-Cookie header strings
     */
    parseAndStore(setCookieHeaders) {
       const list = Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders];
@@ -167,11 +173,14 @@ class CookieJar {
          const name  = nameVal.substring(0, eqIdx).trim();
          const value = nameVal.substring(eqIdx + 1).trim();
          this._cookies.set(name, value);
-         if (debug >= 3) log(`[Cookie] Gespeichert: ${name}=${value.substring(0, 30)}...`, 'debug');
+         if (debug >= 3) log(`[Cookie] Stored: ${name}=${value.substring(0, 30)}...`, 'debug');
       }
    }
 
-   /** Gibt den Cookie-Header-String für ausgehende Requests zurück */
+   /**
+    * Returns the Cookie header string for outgoing requests.
+    * @returns {string} Formatted cookie string
+    */
    getCookieHeader() {
       return Array.from(this._cookies.entries())
          .map(([name, value]) => `${name}=${value}`)
@@ -186,30 +195,35 @@ class CookieJar {
 }
 
 // -------------------------------------------------------------------------------------------------------------------
-// EnphaseCloudClient – Hauptklasse für Login und Batteriesteuerung
+// EnphaseCloudClient -- main class for login and battery control
 // -------------------------------------------------------------------------------------------------------------------
 class EnphaseCloudClient {
    constructor(email, password) {
       this.email      = email;
       this.password   = password;
-      this.jwtToken   = null;  // JWT Bearer Token
-      this.jwtExp     = null;  // JWT Ablaufzeit (Unix-Sekunden)
+      this.jwtToken   = null;  // JWT Bearer token
+      this.jwtExp     = null;  // JWT expiry time (Unix seconds)
       this.xsrfToken  = null;  // BP-XSRF-Token
-      this.userId       = null;  // Numerische User-ID
-      this.batteryId    = null;  // Numerische Site/Battery-ID
-      this.supportsMqtt = null;  // null = unbekannt, true/false nach erstem readBatteryDischargeStatus()
+      this.userId       = null;  // Numeric user ID
+      this.batteryId    = null;  // Numeric site/battery ID
+      this.supportsMqtt = null;  // null = unknown, true/false after first readBatteryDischargeStatus()
       this.cookieJar    = new CookieJar();
    }
 
    // ------------------------------------------------
-   // HTTP-Request mit Cookie-Jar
-   // Wichtig: Cookies aus Set-Cookie-Headern werden automatisch gespeichert.
-   // Bei redirect:'manual' werden auch 302-Cookies korrekt erfasst.
+   // _fetch: HTTP request with cookie jar
+   //
+   // Cookies from Set-Cookie response headers are automatically stored.
+   // With redirect:'manual', cookies from 302 intermediate responses are captured correctly.
+   //
+   // @param {string} url        - Request URL
+   // @param {object} options    - fetch options (method, headers, body, redirect, ...)
+   // @returns {Response}        - node-fetch Response object
    // ------------------------------------------------
    async _fetch(url, options = {}) {
       options.headers = options.headers || {};
 
-      // Vorhandene Cookies anhängen (mit bestehendem Cookie-Header zusammenführen)
+      // Append existing cookies (merge with any existing Cookie header)
       const cookieStr = this.cookieJar.getCookieHeader();
       if (cookieStr) {
          const existing = options.headers['Cookie'] || options.headers['cookie'] || '';
@@ -220,10 +234,10 @@ class EnphaseCloudClient {
 
       const response = await fetch(url, options);
 
-      // Set-Cookie aus Antwort speichern – kompatibel mit node-fetch v2 und v3
+      // Store Set-Cookie from response -- compatible with node-fetch v2 and v3
       let setCookies = null;
       if (response.headers && typeof response.headers.raw === 'function') {
-         setCookies = response.headers.raw()['set-cookie']; // node-fetch v2: Array
+         setCookies = response.headers.raw()['set-cookie']; // node-fetch v2: array
       } else if (response.headers && typeof response.headers.getSetCookie === 'function') {
          setCookies = response.headers.getSetCookie();       // node-fetch v3 / native fetch
       } else {
@@ -234,12 +248,15 @@ class EnphaseCloudClient {
          this.cookieJar.parseAndStore(setCookies);
       }
 
-      if (debug >= 3) log(`[HTTP] Antwort: ${response.status} ${response.statusText}`, 'debug');
+      if (debug >= 3) log(`[HTTP] Response: ${response.status} ${response.statusText}`, 'debug');
       return response;
    }
 
    // ------------------------------------------------
-   // JWT-Payload Base64url-dekodieren
+   // _jwtPayload: decode the JWT payload from Base64url
+   //
+   // @param {string} jwt   - JWT string (header.payload.signature)
+   // @returns {object|null} Decoded payload object, or null on error
    // ------------------------------------------------
    _jwtPayload(jwt) {
       try {
@@ -248,84 +265,90 @@ class EnphaseCloudClient {
          const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
          return JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
       } catch (e) {
-         if (debug >= 1) log(`[JWT] Payload-Dekodierung fehlgeschlagen: ${e instanceof Error ? e.message : String(e)}`, 'warn');
+         if (debug >= 1) log(`[JWT] Payload decoding failed: ${e instanceof Error ? e.message : String(e)}`, 'warn');
          return null;
       }
    }
 
    // ------------------------------------------------
-   // checkToken: Prüft ob der JWT noch mind. 1 Stunde gültig ist
+   // checkToken: checks whether the JWT is still valid for at least 1 hour
+   //
+   // @returns {boolean} true if the token is valid, false otherwise
    // ------------------------------------------------
    checkToken() {
       if (!this.jwtToken) {
-         if (debug >= 2) log('[checkToken] Kein JWT Token vorhanden', 'info');
+         if (debug >= 1) log('[checkToken] No JWT token present', 'info');
          return false;
       }
       const exp = this.jwtExp;
       if (!exp || typeof exp !== 'number') {
-         if (debug >= 2) log('[checkToken] JWT Ablaufzeit nicht bekannt', 'info');
+         if (debug >= 1) log('[checkToken] JWT expiry time not known', 'info');
          return false;
       }
       const nowSec    = Math.floor(Date.now() / 1000);
-      const valid     = exp > (nowSec + 3600); // 1 Stunde Puffer
+      const valid     = exp > (nowSec + 3600); // 1 hour buffer
       if (debug >= 1) {
          const remainMin = Math.round((exp - nowSec) / 60);
-         log(`[checkToken] JWT läuft in ${remainMin} Minuten ab – gültig: ${valid}`, 'info');
+         log(`[checkToken] JWT expires in ${remainMin} minutes -- valid: ${valid}`, 'info');
       }
       return valid;
    }
 
    // ------------------------------------------------
-   // getCsrfToken: authenticity_token von der Login-Seite holen
+   // getCsrfToken: fetch authenticity_token from the login page
+   //
+   // @returns {string} CSRF token value
    // ------------------------------------------------
    async getCsrfToken() {
-      if (debug >= 1) log('[getCsrfToken] Lade Enphase Login-Seite', 'info');
+      if (debug >= 2) log('[getCsrfToken] Loading Enphase login page', 'info');
 
       const response = await this._fetch(`${ENLIGHTEN_BASE}/login`);
       if (!response.ok) {
-         throw new Error(`Login-Seite nicht erreichbar: HTTP ${response.status}`);
+         throw new Error(`Login page not reachable: HTTP ${response.status}`);
       }
 
       const html  = await response.text();
       const match = html.match(/name=["']authenticity_token["'][^>]*value=["']([^"']+)["']/);
       if (!match) {
-         throw new Error('authenticity_token nicht auf der Login-Seite gefunden');
+         throw new Error('authenticity_token not found on login page');
       }
 
       const token = match[1];
-      if (debug >= 2) log(`[getCsrfToken] CSRF Token: ${token.substring(0, 20)}...`, 'info');
+      if (debug >= 2) log(`[getCsrfToken] CSRF token: ${token.substring(0, 20)}...`, 'info');
       return token;
    }
 
    // ------------------------------------------------
-   // getJwtToken: JWT Token nach erfolgreichem Login abrufen
+   // getJwtToken: retrieve the JWT token after a successful login
    //
-   // Primär: GET /app-api/jwt_token.json (Python-Projekt, bewährt)
-   // Fallback: GET /service/auth_ms_enho/api/v1/session/token (HAR-Analyse, Browser)
+   // Primary:  GET /app-api/jwt_token.json (Python project, proven)
+   // Fallback: GET /service/auth_ms_enho/api/v1/session/token (HAR analysis, browser)
+   //
+   // @returns {string} JWT token string
    // ------------------------------------------------
    async getJwtToken() {
-      if (debug >= 1) log('[getJwtToken] Rufe JWT Token ab', 'info');
+      if (debug >= 1) log('[getJwtToken] Fetching JWT token', 'info');
 
-      // --- Primärer Weg: /app-api/jwt_token.json (Python-Projekt) ---
+      // --- Primary path: /app-api/jwt_token.json ---
       let token = null;
       try {
          const resp = await this._fetch(`${ENLIGHTEN_BASE}/app-api/jwt_token.json`);
          if (resp.ok) {
             const data = await resp.json();
             token = data.token || null;
-            if (token && debug >= 1) log('[getJwtToken] JWT via jwt_token.json erhalten', 'info');
+            if (token && debug >= 1) log('[getJwtToken] JWT received via jwt_token.json', 'info');
          } else if (debug >= 1) {
-            log(`[getJwtToken] jwt_token.json HTTP ${resp.status} – versuche Fallback`, 'warn');
+            log(`[getJwtToken] jwt_token.json HTTP ${resp.status} -- trying fallback`, 'warn');
          }
       } catch (e) {
-         if (debug >= 1) log(`[getJwtToken] jwt_token.json Fehler: ${e instanceof Error ? e.message : String(e)} – versuche Fallback`, 'warn');
+         if (debug >= 1) log(`[getJwtToken] jwt_token.json error: ${e instanceof Error ? e.message : String(e)} -- trying fallback`, 'warn');
       }
 
-      // --- Fallback: auth_ms_enho (Browser-Weg aus HAR) ---
+      // --- Fallback: auth_ms_enho (browser path from HAR) ---
       if (!token) {
          const sessionHex = this.cookieJar.get('_enlighten_4_session');
          if (!sessionHex) {
-            throw new Error('_enlighten_4_session Cookie fehlt und jwt_token.json schlug fehl');
+            throw new Error('_enlighten_4_session cookie missing and jwt_token.json failed');
          }
          const response = await this._fetch(`${ENLIGHTEN_BASE}/service/auth_ms_enho/api/v1/session/token`, {
             headers: {
@@ -335,12 +358,12 @@ class EnphaseCloudClient {
          });
          if (!response.ok) {
             const errorBody = await response.text();
-            throw new Error(`JWT Abruf fehlgeschlagen: HTTP ${response.status} – ${errorBody}`);
+            throw new Error(`JWT retrieval failed: HTTP ${response.status} -- ${errorBody}`);
          }
          const data = await response.json();
          token = data.token || null;
-         if (!token) throw new Error('JWT Token nicht in der Server-Antwort enthalten');
-         if (debug >= 1) log('[getJwtToken] JWT via auth_ms_enho erhalten', 'info');
+         if (!token) throw new Error('JWT token not present in server response');
+         if (debug >= 1) log('[getJwtToken] JWT received via auth_ms_enho', 'info');
       }
 
       this.jwtToken = token;
@@ -348,32 +371,38 @@ class EnphaseCloudClient {
       this.jwtExp   = (payload && typeof payload.exp === 'number') ? payload.exp : null;
 
       if (debug >= 1) {
-         const expStr = this.jwtExp ? new Date(this.jwtExp * 1000).toISOString() : 'unbekannt';
-         log(`[getJwtToken] JWT gültig bis: ${expStr}`, 'info');
+         const expStr = this.jwtExp ? new Date(this.jwtExp * 1000).toISOString() : 'unknown';
+         log(`[getJwtToken] JWT valid until: ${expStr}`, 'info');
       }
       return token;
    }
 
    // ------------------------------------------------
-   // _discoverIds: user_id und battery_id automatisch ermitteln
+   // _discoverIds: automatically determine user_id and battery_id
+   //
+   // Follows the redirect after login to extract the site ID from the URL,
+   // then fetches app data to resolve the numeric user ID.
+   //
+   // @returns {void} Sets this.userId and this.batteryId
    // ------------------------------------------------
    async _discoverIds() {
-      if (debug >= 1) log('[discoverIds] Ermittle User-ID und Battery-ID', 'info');
+      if (debug >= 1) log('[discoverIds] Determining user ID and battery ID', 'info');
 
       const homeResp = await this._fetch(`${ENLIGHTEN_BASE}/`, { redirect: 'follow' });
       const finalUrl = homeResp.url;
-      if (debug >= 2) log(`[discoverIds] Finale URL: ${finalUrl}`, 'info');
+      if (debug >= 2) log(`[discoverIds] Final URL: ${finalUrl}`, 'info');
 
       const siteMatch = finalUrl.match(/\/(web|pv\/systems|systems)\/([0-9]+)/);
       if (!siteMatch) {
-         throw new Error(`Konnte Site-ID nicht aus Redirect-URL ermitteln: ${finalUrl}`);
+         throw new Error(`Could not extract site ID from redirect URL: ${finalUrl}`);
       }
       const siteId = siteMatch[2];
 
       const appUrl  = `${ENLIGHTEN_BASE}/app-api/${siteId}/data.json?app=1&device_status=non_retired&is_mobile=0`;
+      if (debug >= 2) log(`[discoverIds] Fetching app data: ${appUrl}`, 'info');
       const appResp = await this._fetch(appUrl);
       if (!appResp.ok) {
-         throw new Error(`App-Daten Abruf fehlgeschlagen: HTTP ${appResp.status}`);
+         throw new Error(`App data fetch failed: HTTP ${appResp.status}`);
       }
 
       const appData  = await appResp.json();
@@ -383,7 +412,7 @@ class EnphaseCloudClient {
                     || (appBlock.user && appBlock.user.id);
 
       if (!userId || !/^\d+$/.test(String(userId))) {
-         throw new Error('Konnte numerische User-ID nicht aus App-Daten ermitteln');
+         throw new Error('Could not extract numeric user ID from app data');
       }
 
       if (!this.batteryId) this.batteryId = String(siteId);
@@ -393,10 +422,15 @@ class EnphaseCloudClient {
    }
 
    // ------------------------------------------------
-   // updateToken: BP-XSRF-Token erneuern
+   // updateToken: renew the BP-XSRF-Token
+   //
+   // POSTs to the isValid endpoint to trigger the server to issue a new
+   // BP-XSRF-Token cookie. Falls back to manual Set-Cookie header extraction.
+   //
+   // @returns {string} The new XSRF token value
    // ------------------------------------------------
    async updateToken() {
-      if (debug >= 1) log('[updateToken] Aktualisiere BP-XSRF-Token', 'info');
+      if (debug >= 1) log('[updateToken] Refreshing BP-XSRF-Token', 'info');
 
       if (!this.batteryId || !this.userId) {
          await this._discoverIds();
@@ -417,10 +451,10 @@ class EnphaseCloudClient {
          body:    JSON.stringify({ scheduleType: 'dtg' }),
       });
 
-      // BP-XSRF-Token aus dem Cookie-Jar (wurde von _fetch automatisch gespeichert)
+      // BP-XSRF-Token from cookie jar (automatically stored by _fetch)
       let xsrfToken = this.cookieJar.get('BP-XSRF-Token');
 
-      // Fallback: manuell aus dem Set-Cookie Header extrahieren
+      // Fallback: extract manually from Set-Cookie header
       if (!xsrfToken) {
          const setCookie = response.headers.get('set-cookie') || '';
          const match     = setCookie.match(/BP-XSRF-Token=([^;]+)/);
@@ -431,41 +465,48 @@ class EnphaseCloudClient {
       }
 
       if (!xsrfToken) {
-         // Response-Body loggen für Diagnose
-         const body = await response.text().catch(() => '(kein Body)');
-         throw new Error(`BP-XSRF-Token nicht erhalten (HTTP ${response.status}): ${body}`);
+         // Log response body for diagnosis
+         const body = await response.text().catch(() => '(no body)');
+         throw new Error(`BP-XSRF-Token not received (HTTP ${response.status}): ${body}`);
       }
 
       this.xsrfToken = xsrfToken;
-      if (debug >= 1) log(`[updateToken] XSRF Token erhalten: ${xsrfToken.substring(0, 15)}...`, 'info');
+      if (debug >= 1) log(`[updateToken] XSRF token received: ${xsrfToken.substring(0, 15)}...`, 'info');
       return xsrfToken;
    }
 
    // ------------------------------------------------
-   // login: Vollständiger Login-Ablauf
+   // login: complete login flow
    //
-   // FIX: Login-POST verwendet redirect:'manual' damit die 302-Antwort
-   // mit dem Session-Cookie (_enlighten_session) korrekt erfasst wird.
-   // Bei fetch(redirect:'follow') gehen Cookies aus Intermediate-Redirects verloren,
-   // was dazu führt dass updateToken() keine gültige Session vorfindet
-   // und den BP-XSRF-Token nicht erhält.
+   // Steps:
+   //   1. Fetch CSRF token from login page
+   //   2. POST credentials with redirect:'manual' to capture 302-cookies
+   //   3. Manually follow redirect
+   //   4. Fetch JWT token
+   //   5. Discover user/battery IDs
+   //   6. Fetch XSRF token
+   //   7. Persist tokens to states and cache file
+   //
+   // Fix: Login POST uses redirect:'manual' so the 302 response with the
+   // session cookie (_enlighten_session) is correctly captured by _fetch.
+   // With redirect:'follow', cookies from intermediate redirects are lost.
    // ------------------------------------------------
    async login() {
-      if (debug >= 0) log('[login] Starte Enphase Login', 'info');
+      if (debug >= 1) log('[login] Starting Enphase login', 'info');
 
       if (!this.email || !this.password) {
-         throw new Error('Email und Passwort sind für den Login erforderlich');
+         throw new Error('Email and password are required for login');
       }
 
-      // Cookies löschen für sauberen Login-Start
+      // Clear cookies for a clean login
       this.cookieJar.clear();
 
-      // Schritt 1: CSRF Token holen
+      // Step 1: get CSRF token
       const authenticityToken = await this.getCsrfToken();
 
-      // Schritt 2: Login POST mit redirect:'manual'
-      // WICHTIG: 'manual' statt 'follow' – nur so werden die Cookies der 302-Antwort
-      // (insbesondere der Session-Cookie _enlighten_session) vom Cookie-Jar erfasst.
+      // Step 2: Login POST with redirect:'manual'
+      // IMPORTANT: 'manual' instead of 'follow' -- only this way are cookies from the
+      // 302 response (in particular _enlighten_session) captured by the cookie jar.
       const loginPayload = new URLSearchParams({
          'utf8':               '✓',
          'authenticity_token': authenticityToken,
@@ -473,55 +514,58 @@ class EnphaseCloudClient {
          'user[password]':     this.password,
       });
 
-      if (debug >= 2) log('[login] Sende Login-Credentials (redirect:manual)', 'info');
+      if (debug >= 2) log('[login] Sending login credentials (redirect:manual)', 'info');
       const loginResp = await this._fetch(`${ENLIGHTEN_BASE}/login/login`, {
          method:   'POST',
          headers:  { 'Content-Type': 'application/x-www-form-urlencoded' },
          body:     loginPayload.toString(),
-         redirect: 'manual', // ← FIX: 302-Cookies werden jetzt von _fetch erfasst
+         redirect: 'manual', // Fix: 302-cookies are now captured by _fetch
       });
 
-      if (debug >= 2) log(`[login] Login POST Antwort: HTTP ${loginResp.status}`, 'info');
+      if (debug >= 2) log(`[login] Login POST response: HTTP ${loginResp.status}`, 'info');
 
-      // Erwartete Antworten: 302 (Redirect nach Erfolg) oder 200/303
-      // Alles ausser 4xx/5xx ist akzeptabel
+      // Expected responses: 302 (redirect on success) or 200/303
+      // Anything other than 4xx/5xx is acceptable
       if (loginResp.status >= 400) {
          const loginBody = await loginResp.text().catch(() => '');
-         throw new Error(`Login POST fehlgeschlagen: HTTP ${loginResp.status} – ${loginBody}`);
+         throw new Error(`Login POST failed: HTTP ${loginResp.status} -- ${loginBody}`);
       }
 
-      // Manuell dem Redirect folgen (Cookies aus 302 sind jetzt im Cookie-Jar)
+      // Manually follow redirect (cookies from 302 are now in the cookie jar)
       const location = loginResp.headers.get('location');
       if (location) {
          const redirectUrl = location.startsWith('http') ? location : `${ENLIGHTEN_BASE}${location}`;
-         if (debug >= 2) log(`[login] Folge Redirect zu: ${redirectUrl}`, 'info');
+         if (debug >= 2) log(`[login] Following redirect to: ${redirectUrl}`, 'info');
          await this._fetch(redirectUrl, { redirect: 'follow' });
       }
 
-      if (debug >= 1) log('[login] Login erfolgreich, Session-Cookie gespeichert', 'info');
+      if (debug >= 1) log('[login] Login successful, session cookie stored', 'info');
 
-      // Schritt 3: JWT Token abrufen
+      // Step 3: fetch JWT token
       await this.getJwtToken();
 
-      // Schritt 4: User/Battery-IDs ermitteln
+      // Step 4: discover user/battery IDs
       await this._discoverIds();
 
-      // Schritt 5: XSRF Token holen
+      // Step 5: fetch XSRF token
       await this.updateToken();
 
-      // Schritt 6: Persistenz
+      // Step 6: persist
       await this._saveToStates();
       this._saveCache();
 
-      if (debug >= 0) log('[login] Login vollständig abgeschlossen ✓', 'info');
+      if (debug >= 1) log('[login] Login completed successfully', 'info');
    }
 
    // ------------------------------------------------
-   // ensureTokens: Tokens sicherstellen – Login wenn nötig
+   // ensureTokens: ensure valid tokens are present, re-login if necessary
+   //
+   // @param {boolean} [forceRefresh=false] - Force a new login even if token appears valid
+   // @returns {{ jwtToken: string, xsrfToken: string }}
    // ------------------------------------------------
    async ensureTokens(forceRefresh = false) {
       if (forceRefresh || !this.checkToken()) {
-         if (debug >= 1) log('[ensureTokens] Token abgelaufen/fehlend – starte Neulogin', 'info');
+         if (debug >= 1) log('[ensureTokens] Token expired/missing -- starting re-login', 'info');
          await this.login();
       } else {
          if (!this.userId || !this.batteryId) {
@@ -535,37 +579,43 @@ class EnphaseCloudClient {
    }
 
    // ------------------------------------------------
-   // changeBatteryDischargeSwitch: "Batterieentladung einschränken" (RBD-Modus)
-   //   Einstellungen > Speicher > Batterieentladung einschränken
-   // @param {boolean} enable  true = einschränken aktiv
+   // changeBatteryDischargeSwitch: toggle the "Restrict Battery Discharge" (RBD) mode
+   //
+   // For systems with supportsMqtt=true: sends the command via MQTT + REST PUT.
+   // For older systems (supportsMqtt=false/unknown): uses REST PUT only.
+   // Automatically retries with fresh tokens on HTTP 403.
+   // If AUTO_RESTORE_SCHEDULES is true and enable=true, triggers schedule restore after restoreDelayMs.
+   //
+   // @param {boolean} enable - true = restrict discharge active
+   // @returns {boolean} true on success
    // ------------------------------------------------
    async changeBatteryDischargeSwitch(enable) {
-      log(`[Battery] ▶ changeBatteryDischargeSwitch aufgerufen: enable=${enable}`, 'info');
+      log(`[Battery] changeBatteryDischargeSwitch called: enable=${enable}`, 'info');
 
-      // --- Schritt 1: Tokens sicherstellen ---
-      log('[Battery] Schritt 1: Prüfe/hole Tokens (ensureTokens)', 'info');
+      // --- Step 1: ensure tokens ---
+      if (debug >= 2) log('[Battery] Step 1: checking/fetching tokens (ensureTokens)', 'info');
       await this.ensureTokens();
-      log(`[Battery] Tokens OK – userId=${this.userId}, batteryId=${this.batteryId}`, 'info');
-      log(`[Battery] jwtToken=${this.jwtToken ? this.jwtToken.substring(0, 30) + '...' : 'NULL'}`, 'info');
-      log(`[Battery] xsrfToken=${this.xsrfToken ? this.xsrfToken.substring(0, 20) + '...' : 'NULL'}`, 'info');
-      log(`[Battery] Cookies im Jar: ${this.cookieJar.getCookieHeader().replace(/=[^;]{10,}/g, '=***')}`, 'info');
+      if (debug >= 2) log(`[Battery] Tokens OK -- userId=${this.userId}, batteryId=${this.batteryId}`, 'info');
+      if (debug >= 2) log(`[Battery] jwtToken=${this.jwtToken ? this.jwtToken.substring(0, 30) + '...' : 'NULL'}`, 'info');
+      if (debug >= 2) log(`[Battery] xsrfToken=${this.xsrfToken ? this.xsrfToken.substring(0, 20) + '...' : 'NULL'}`, 'info');
+      if (debug >= 3) log(`[Battery] Cookies in jar: ${this.cookieJar.getCookieHeader().replace(/=[^;]{10,}/g, '=***')}`, 'info');
 
-      // --- Schritt 2: Pfad wählen (MQTT für supportsMqtt:true, REST als Fallback) ---
-      log(`[Battery] Schritt 2: supportsMqtt=${this.supportsMqtt}`, 'info');
+      // --- Step 2: choose path (MQTT for supportsMqtt:true, REST as fallback) ---
+      if (debug >= 2) log(`[Battery] Step 2: supportsMqtt=${this.supportsMqtt}`, 'info');
 
       if (this.supportsMqtt === true) {
-         // MQTT-Pfad: REST-PUT wird vom Server ignoriert (gibt zwar "success" zurück,
-         // ändert aber nichts) → Einstellung per MQTT an das Gerät senden
-         log('[Battery] Schritt 3: MQTT-Pfad (supportsMqtt=true)', 'info');
+         // MQTT path: REST PUT is ignored by the server (returns "success" but changes nothing)
+         // --> send setting via MQTT to the device
+         if (debug >= 1) log('[Battery] Step 3: MQTT path (supportsMqtt=true)', 'info');
          const mqttInfo = await this.getMqttSignedUrl();
          await this.changeBatteryViaMqtt(enable, mqttInfo);
       } else {
-         // REST-Pfad: für ältere Systeme ohne MQTT
-         log('[Battery] Schritt 3: REST-Pfad (supportsMqtt=false/unbekannt)', 'info');
+         // REST path: for older systems without MQTT
+         if (debug >= 1) log('[Battery] Step 3: REST path (supportsMqtt=false/unknown)', 'info');
          const url = `${ENLIGHTEN_BASE}/service/batteryConfig/api/v1/batterySettings/${this.batteryId}?userId=${this.userId}&source=enho`;
          const payload = JSON.stringify({ rbdControl: { enabled: enable } });
-         log(`[Battery] PUT ${url}`, 'info');
-         log(`[Battery] Payload=${payload}`, 'info');
+         if (debug >= 2) log(`[Battery] PUT ${url}`, 'info');
+         if (debug >= 2) log(`[Battery] Payload=${payload}`, 'info');
 
          const headers = {
             'Content-Type': 'application/json',
@@ -577,42 +627,44 @@ class EnphaseCloudClient {
          };
          let response = await this._fetch(url, { method: 'PUT', headers, body: payload });
          const body1  = await response.text();
-         log(`[Battery] REST Antwort: HTTP ${response.status} – ${body1}`, response.ok ? 'info' : 'warn');
+         if (debug >= 1) log(`[Battery] REST response: HTTP ${response.status}`, response.ok ? 'info' : 'warn');
+         if (debug >= 2) log(`[Battery] REST response body: ${body1}`, 'info');
 
          if (response.status === 403) {
-            log('[Battery] 403 – hole neue Tokens und wiederhole', 'warn');
+            log('[Battery] 403 -- fetching new tokens and retrying', 'warn');
             await this.ensureTokens(true);
             headers['e-auth-token'] = this.jwtToken;
             headers['x-xsrf-token'] = this.xsrfToken;
             response = await this._fetch(url, { method: 'PUT', headers, body: payload });
             const body2 = await response.text();
-            log(`[Battery] REST Wiederholung: HTTP ${response.status} – ${body2}`, response.ok ? 'info' : 'warn');
-            if (!response.ok) throw new Error(`changeBatteryDischargeSwitch fehlgeschlagen: HTTP ${response.status} – ${body2}`);
+            if (debug >= 1) log(`[Battery] REST retry: HTTP ${response.status}`, response.ok ? 'info' : 'warn');
+            if (debug >= 2) log(`[Battery] REST retry body: ${body2}`, 'info');
+            if (!response.ok) throw new Error(`changeBatteryDischargeSwitch failed: HTTP ${response.status} -- ${body2}`);
          } else if (!response.ok) {
-            throw new Error(`changeBatteryDischargeSwitch fehlgeschlagen: HTTP ${response.status} – ${body1}`);
+            throw new Error(`changeBatteryDischargeSwitch failed: HTTP ${response.status} -- ${body1}`);
          }
       }
 
-      // --- Schritt 4: State aktualisieren ---
+      // --- Step 4: update states ---
       setState(dpControl + 'battery_discharge_restrict', enable, true);
       setState(dpStatus  + 'battery_discharge_cloud',    enable, true);
-      log(`[Battery] ✓ "Batterieentladung einschränken" erfolgreich auf ${enable} gesetzt`, 'info');
+      log(`[Battery] "Restrict battery discharge" successfully set to ${enable}`, 'info');
 
-      // --- Schritt 5: Zeitpläne automatisch wiederherstellen (falls konfiguriert) ---
+      // --- Step 5: automatically restore schedules (if configured) ---
       if (enable && AUTO_RESTORE_SCHEDULES) {
          const storedRaw = getState(dpSchedD + 'raw_json').val;
          const hasStored = storedRaw && storedRaw !== '[]' && storedRaw !== '';
          if (hasStored) {
-            log(`[Battery] Auto-Restore: warte ${restoreDelayMs}ms, dann stelle Zeitpläne wieder her...`, 'info');
+            if (debug >= 1) log(`[Battery] Auto-restore: waiting ${restoreDelayMs}ms, then restoring schedules`, 'info');
             setTimeout(async () => {
                try {
                   await enphaseClient.restoreDischargeSchedules();
                } catch (err) {
-                  log(`[Battery] Auto-Restore Zeitpläne fehlgeschlagen: ${err instanceof Error ? err.message : String(err)}`, 'warn');
+                  log(`[Battery] Auto-restore schedules failed: ${err instanceof Error ? err.message : String(err)}`, 'warn');
                }
             }, restoreDelayMs);
          } else {
-            log('[Battery] Auto-Restore: keine gespeicherten Entlade-Zeitpläne vorhanden (zuerst "read_discharge_schedules" ausführen)', 'info');
+            if (debug >= 1) log('[Battery] Auto-restore: no stored discharge schedules found (run "read_discharge_schedules" first)', 'info');
          }
       }
 
@@ -620,19 +672,22 @@ class EnphaseCloudClient {
    }
 
    // ------------------------------------------------
-   // readBatteryDischargeStatus: Aktuellen RBD-Status von Enphase Cloud lesen
-   //   Liest rbdControl.enabled aus GET /batterySettings
-   // @returns {boolean} true = Einschränkung aktiv
+   // readBatteryDischargeStatus: read the current RBD status from Enphase cloud
+   //
+   // Reads rbdControl.enabled from GET /batterySettings and updates the
+   // corresponding ioBroker states. Also captures supportsMqtt for later use.
+   //
+   // @returns {boolean|null} true = restriction active, null = field not found
    // ------------------------------------------------
    async readBatteryDischargeStatus() {
-      log('[BatteryRead] ▶ Lese aktuellen "Batterieentladung einschränken" Status', 'info');
+      log('[BatteryRead] Reading current "Restrict Battery Discharge" status', 'info');
 
-      // Tokens sicherstellen
+      // Ensure tokens
       await this.ensureTokens();
-      log(`[BatteryRead] userId=${this.userId}, batteryId=${this.batteryId}`, 'info');
+      if (debug >= 2) log(`[BatteryRead] userId=${this.userId}, batteryId=${this.batteryId}`, 'info');
 
       const url = `${ENLIGHTEN_BASE}/service/batteryConfig/api/v1/batterySettings/${this.batteryId}?source=enho&userId=${this.userId}`;
-      log(`[BatteryRead] GET ${url}`, 'info');
+      if (debug >= 2) log(`[BatteryRead] GET ${url}`, 'info');
 
       const response = await this._fetch(url, {
          headers: {
@@ -645,22 +700,22 @@ class EnphaseCloudClient {
 
       if (!response.ok) {
          const body = await response.text();
-         throw new Error(`readBatteryDischargeStatus fehlgeschlagen: HTTP ${response.status} – ${body}`);
+         throw new Error(`readBatteryDischargeStatus failed: HTTP ${response.status} -- ${body}`);
       }
 
       let data;
       const rawText = await response.text();
-      log(`[BatteryRead] HTTP ${response.status} – Rohantwort: ${rawText}`, 'info');
+      if (debug >= 2) log(`[BatteryRead] HTTP ${response.status} -- raw response: ${rawText}`, 'info');
       try {
          data = JSON.parse(rawText);
       } catch (e) {
-         throw new Error(`readBatteryDischargeStatus: Antwort ist kein gültiges JSON – ${rawText.substring(0, 200)}`);
+         throw new Error(`readBatteryDischargeStatus: response is not valid JSON -- ${rawText.substring(0, 200)}`);
       }
 
-      // Top-Level-Schlüssel ausgeben, um die Struktur zu verstehen
-      log(`[BatteryRead] Top-Level-Keys: ${Object.keys(data).join(', ')}`, 'info');
+      // Log top-level keys to understand the structure
+      if (debug >= 2) log(`[BatteryRead] Top-level keys: ${Object.keys(data).join(', ')}`, 'info');
 
-      // Antwortstruktur: { type, timestamp, data: { rbdControl, supportsMqtt, ... } }
+      // Response structure: { type, timestamp, data: { rbdControl, supportsMqtt, ... } }
       const settings   = data.data || data.batterySettings || data.settings || data;
       const rbdControl = settings.rbdControl;
       const rbdEnabled = rbdControl && typeof rbdControl.enabled === 'boolean'
@@ -668,40 +723,42 @@ class EnphaseCloudClient {
          : null;
 
       if (rbdEnabled === null) {
-         log(`[BatteryRead] rbdControl.enabled nicht gefunden – rbdControl=${JSON.stringify(rbdControl)}`, 'warn');
+         log(`[BatteryRead] rbdControl.enabled not found -- rbdControl=${JSON.stringify(rbdControl)}`, 'warn');
       } else {
-         log(`[BatteryRead] rbdControl.enabled = ${rbdEnabled}`, 'info');
+         if (debug >= 1) log(`[BatteryRead] rbdControl.enabled = ${rbdEnabled}`, 'info');
       }
 
-      // supportsMqtt merken für changeBatteryDischargeSwitch()
+      // Store supportsMqtt for changeBatteryDischargeSwitch()
       if (typeof settings.supportsMqtt === 'boolean') this.supportsMqtt = settings.supportsMqtt;
-      log(`[BatteryRead] supportsMqtt=${settings.supportsMqtt}`, 'info');
-      log(`[BatteryRead] requestedConfig=${JSON.stringify(settings.requestedConfig)}`, 'info');
-      log(`[BatteryRead] requestedConfigMqtt=${JSON.stringify(settings.requestedConfigMqtt)}`, 'info');
+      if (debug >= 1) log(`[BatteryRead] supportsMqtt=${settings.supportsMqtt}`, 'info');
+      if (debug >= 2) log(`[BatteryRead] requestedConfig=${JSON.stringify(settings.requestedConfig)}`, 'info');
+      if (debug >= 2) log(`[BatteryRead] requestedConfigMqtt=${JSON.stringify(settings.requestedConfigMqtt)}`, 'info');
 
-      // States aktualisieren
+      // Update states
       if (rbdEnabled !== null) {
          setState(dpStatus  + 'battery_discharge_cloud',    rbdEnabled, true);
          setState(dpControl + 'battery_discharge_restrict', rbdEnabled, true);
-         log(`[BatteryRead] ✓ battery_discharge_restrict = ${rbdEnabled}`, 'info');
+         if (debug >= 1) log(`[BatteryRead] battery_discharge_restrict = ${rbdEnabled}`, 'info');
       }
 
       return rbdEnabled;
    }
 
    // ------------------------------------------------
-   // readChargeFromGrid: "Laden über Stromnetz"-Status von Enphase Cloud lesen
-   //   Liest chargingFromGridEnabled (oder gridCharging.enabled) aus GET /batterySettings
-   //   und speichert den Wert in dpStatus+'charge_from_grid_cloud' und
-   //   dpControl+'battery_charge_from_grid_enable'.
-   // @returns {boolean|null}  true = Netzladen aktiv, null = Feld nicht gefunden
+   // readChargeFromGrid: read the "Charge from Grid" status from Enphase cloud
+   //
+   // Reads chargeFromGrid (and optionally batteryGridMode) from GET /batterySettings
+   // and stores the values in dpStatus+'charge_from_grid_cloud' and
+   // dpControl+'battery_charge_from_grid_enable'.
+   //
+   // @returns {boolean|null} true = grid charging active, null = field not found
    // ------------------------------------------------
    async readChargeFromGrid() {
-      log('[GridCharge] ▶ Lese "Laden über Stromnetz" Status von Enphase Cloud', 'info');
+      log('[GridCharge] Reading "Charge from Grid" status from Enphase cloud', 'info');
       await this.ensureTokens();
 
       const url = `${ENLIGHTEN_BASE}/service/batteryConfig/api/v1/batterySettings/${this.batteryId}?source=enho&userId=${this.userId}`;
-      log(`[GridCharge] GET ${url}`, 'info');
+      if (debug >= 2) log(`[GridCharge] GET ${url}`, 'info');
 
       const response = await this._fetch(url, {
          headers: {
@@ -714,7 +771,7 @@ class EnphaseCloudClient {
 
       if (!response.ok) {
          const body = await response.text();
-         throw new Error(`readChargeFromGrid fehlgeschlagen: HTTP ${response.status} – ${body}`);
+         throw new Error(`readChargeFromGrid failed: HTTP ${response.status} -- ${body}`);
       }
 
       const rawText = await response.text();
@@ -722,46 +779,50 @@ class EnphaseCloudClient {
       try {
          data = JSON.parse(rawText);
       } catch (e) {
-         throw new Error(`readChargeFromGrid: kein gültiges JSON – ${rawText.substring(0, 200)}`);
+         throw new Error(`readChargeFromGrid: not valid JSON -- ${rawText.substring(0, 200)}`);
       }
 
-      // Antwortstruktur: { type, timestamp, data: { ... } }
+      // Response structure: { type, timestamp, data: { ... } }
       const settings = data.data || data.batterySettings || data.settings || data;
 
-      // --- Netzladen aktiv/inaktiv (chargeFromGrid) ---
+      // --- Grid charging enabled/disabled ---
       const gridChargeEnabled = typeof settings.chargeFromGrid === 'boolean' ? settings.chargeFromGrid : null;
       if (gridChargeEnabled === null) {
-         log(`[GridCharge] ⚠ Feld 'chargeFromGrid' nicht gefunden – Keys: ${Object.keys(settings).join(', ')}`, 'warn');
+         log(`[GridCharge] Field 'chargeFromGrid' not found -- keys: ${Object.keys(settings).join(', ')}`, 'warn');
       } else {
          setState(dpStatus  + 'charge_from_grid_cloud', gridChargeEnabled, true);
          setState(dpControl + 'battery_charge_from_grid_enable',       gridChargeEnabled, true);
-         log(`[GridCharge] chargeFromGrid = ${gridChargeEnabled}`, 'info');
+         if (debug >= 1) log(`[GridCharge] chargeFromGrid = ${gridChargeEnabled}`, 'info');
       }
 
-      // --- Zusätzliche Statusfelder (informativ) ---
+      // --- Additional status fields (informational) ---
       const gridMode = typeof settings.batteryGridMode === 'string' ? settings.batteryGridMode : '';
       if (gridMode) {
          setState(dpStatus + 'battery_grid_mode', gridMode, true);
-         log(`[GridCharge] batteryGridMode = ${gridMode}`, 'info');
+         if (debug >= 1) log(`[GridCharge] batteryGridMode = ${gridMode}`, 'info');
       }
       if (debug >= 2) {
          log(`[GridCharge] chargeFromGridScheduleEnabled=${settings.chargeFromGridScheduleEnabled}`, 'info');
          log(`[GridCharge] chargeBeginTime=${settings.chargeBeginTime}, chargeEndTime=${settings.chargeEndTime}`, 'info');
       }
 
-      log(`[GridCharge] ✓ Netzlade-Status gespeichert`, 'info');
+      if (debug >= 1) log('[GridCharge] Grid-charge status stored', 'info');
       return gridChargeEnabled;
    }
 
    // ------------------------------------------------
-   // changeChargeFromGrid: "Laden über Stromnetz" aktivieren/deaktivieren
-   //   Setzt chargingFromGridEnabled per PUT /batterySettings
-   // @param {boolean} enable  true = Netzladen aktiv
+   // changeChargeFromGrid: enable or disable "Charge from Grid"
+   //
+   // Sends chargeFromGrid via PUT /batterySettings.
+   // Automatically retries with fresh tokens on HTTP 403.
+   //
+   // @param {boolean} enable - true = grid charging active
+   // @returns {boolean} true on success
    // ------------------------------------------------
    async changeChargeFromGrid(enable) {
-      log(`[GridCharge] ▶ changeChargeFromGrid aufgerufen: enable=${enable}`, 'info');
+      log(`[GridCharge] changeChargeFromGrid called: enable=${enable}`, 'info');
       await this.ensureTokens();
-      log(`[GridCharge] Tokens OK – userId=${this.userId}, batteryId=${this.batteryId}`, 'info');
+      if (debug >= 2) log(`[GridCharge] Tokens OK -- userId=${this.userId}, batteryId=${this.batteryId}`, 'info');
 
       const url = `${ENLIGHTEN_BASE}/service/batteryConfig/api/v1/batterySettings/${this.batteryId}?userId=${this.userId}&source=enho`;
       const headers = {
@@ -774,45 +835,51 @@ class EnphaseCloudClient {
       };
 
       const payload = JSON.stringify({ chargeFromGrid: enable });
-      log(`[GridCharge] PUT ${url}`, 'info');
-      log(`[GridCharge] Payload: ${payload}`, 'info');
+      if (debug >= 2) log(`[GridCharge] PUT ${url}`, 'info');
+      if (debug >= 2) log(`[GridCharge] Payload: ${payload}`, 'info');
 
       let response = await this._fetch(url, { method: 'PUT', headers, body: payload });
       const body1  = await response.text();
-      log(`[GridCharge] Antwort: HTTP ${response.status} – ${body1}`, response.ok ? 'info' : 'warn');
+      if (debug >= 1) log(`[GridCharge] Response: HTTP ${response.status}`, response.ok ? 'info' : 'warn');
+      if (debug >= 2) log(`[GridCharge] Response body: ${body1}`, 'info');
 
       if (response.status === 403) {
-         log('[GridCharge] 403 – hole neue Tokens und wiederhole', 'warn');
+         log('[GridCharge] 403 -- fetching new tokens and retrying', 'warn');
          await this.ensureTokens(true);
          headers['e-auth-token'] = this.jwtToken;
          headers['x-xsrf-token'] = this.xsrfToken;
          response = await this._fetch(url, { method: 'PUT', headers, body: payload });
          const body2 = await response.text();
-         log(`[GridCharge] Wiederholung: HTTP ${response.status} – ${body2}`, response.ok ? 'info' : 'warn');
-         if (!response.ok) throw new Error(`changeChargeFromGrid fehlgeschlagen: HTTP ${response.status} – ${body2}`);
+         if (debug >= 1) log(`[GridCharge] Retry: HTTP ${response.status}`, response.ok ? 'info' : 'warn');
+         if (debug >= 2) log(`[GridCharge] Retry body: ${body2}`, 'info');
+         if (!response.ok) throw new Error(`changeChargeFromGrid failed: HTTP ${response.status} -- ${body2}`);
       } else if (!response.ok) {
-         throw new Error(`changeChargeFromGrid fehlgeschlagen: HTTP ${response.status} – ${body1}`);
+         throw new Error(`changeChargeFromGrid failed: HTTP ${response.status} -- ${body1}`);
       }
 
       setState(dpStatus  + 'charge_from_grid_cloud', enable, true);
       setState(dpControl + 'battery_charge_from_grid_enable',       enable, true);
-      log(`[GridCharge] ✓ "Laden über Stromnetz" erfolgreich auf ${enable} gesetzt`, 'info');
+      log(`[GridCharge] "Charge from Grid" successfully set to ${enable}`, 'info');
       return true;
    }
 
    // ------------------------------------------------
-   // readDischargeSchedules: RBD-Zeitpläne auslesen und im ioBroker speichern
+   // readDischargeSchedules: fetch RBD schedules from Enphase cloud and store in ioBroker
+   //
    // API: GET /service/batteryConfig/api/v1/battery/sites/{siteId}/schedules
-   // Nur Zeitpläne mit scheduleType="RBD" werden gespeichert.
-   // Bei mehr Zeitplänen als maxDischargeSchedules → Warnung + Konfiguration anpassen.
-   // @returns {Array} gefundene RBD-Zeitpläne
+   // Only schedules with scheduleType="RBD" that are not soft-deleted are stored.
+   // If more schedules exist than maxDischargeSchedules, auto-expands the limit and creates
+   // the missing ioBroker datapoints.
+   // If Enphase reports 0 schedules, the existing ioBroker config is left unchanged.
+   //
+   // @returns {Array} Active RBD schedules
    // ------------------------------------------------
    async readDischargeSchedules() {
-      log('[SchedD] ▶ Lese RBD-Zeitpläne von Enphase Cloud', 'info');
+      log('[SchedD] Reading RBD schedules from Enphase cloud', 'info');
       await this.ensureTokens();
 
       const url = `${ENLIGHTEN_BASE}/service/batteryConfig/api/v1/battery/sites/${this.batteryId}/schedules`;
-      log(`[SchedD] GET ${url}`, 'info');
+      if (debug >= 2) log(`[SchedD] GET ${url}`, 'info');
 
       const response = await this._fetch(url, {
          headers: {
@@ -823,50 +890,51 @@ class EnphaseCloudClient {
          },
       });
       const text = await response.text();
-      if (!response.ok) throw new Error(`readDischargeSchedules fehlgeschlagen: HTTP ${response.status} – ${text}`);
+      if (!response.ok) throw new Error(`readDischargeSchedules failed: HTTP ${response.status} -- ${text}`);
 
-      // API-Antwortstruktur: { type:"BATTERY_SCHEDULES_CONFIG", rbd:{count:N, details:[...]}, cfg:{...}, dtg:{...} }
-      // RBD-Zeitpläne liegen unter parsed.rbd.details
+      // API response structure: { type:"BATTERY_SCHEDULES_CONFIG", rbd:{count:N, details:[...]}, cfg:{...}, dtg:{...} }
+      // RBD schedules are under parsed.rbd.details
       let rbdSchedules;
       try {
          const parsed = JSON.parse(text);
-         log(`[SchedD] Antwort-Typ: ${parsed.type}, rbd.count=${parsed.rbd?.count ?? 'n/a'}`, 'info');
+         if (debug >= 1) log(`[SchedD] Response type: ${parsed.type}, rbd.count=${parsed.rbd?.count ?? 'n/a'}`, 'info');
+         if (debug >= 3) log(`[SchedD] Full response: ${text}`, 'info');
          rbdSchedules = (parsed.rbd && Array.isArray(parsed.rbd.details))
             ? parsed.rbd.details.filter(s => !s.isDeleted)
             : [];
       } catch (e) {
-         throw new Error(`readDischargeSchedules: kein gültiges JSON – ${text.substring(0, 200)}`);
+         throw new Error(`readDischargeSchedules: not valid JSON -- ${text.substring(0, 200)}`);
       }
 
       const storeCount = rbdSchedules.length;
-      log(`[SchedD] ${storeCount} aktive RBD-Zeitplan(e) gefunden`, 'info');
+      if (debug >= 1) log(`[SchedD] ${storeCount} active RBD schedule(s) found`, 'info');
 
-      // Keine Zeitpläne bei Enphase → ioBroker-Konfiguration unverändert lassen
+      // No schedules at Enphase --> leave existing ioBroker config unchanged
       if (storeCount === 0) {
-         log('[SchedD] ℹ Enphase meldet 0 Zeitpläne – gespeicherte ioBroker-Konfiguration bleibt erhalten', 'info');
+         if (debug >= 1) log('[SchedD] Enphase reports 0 schedules -- stored ioBroker config remains unchanged', 'info');
          return rbdSchedules;
       }
 
-      // Mehr Zeitpläne als konfiguriert → max_rbd_schedules erhöhen + fehlende DPs anlegen
+      // More schedules than configured --> raise max_discharge_schedules + create missing datapoints
       if (storeCount > maxDischargeSchedules) {
-         log(`[SchedD] ℹ ${storeCount} Entlade-Zeitpläne gefunden, max_discharge_schedules=${maxDischargeSchedules} – passe automatisch an`, 'info');
+         log(`[SchedD] ${storeCount} discharge schedules found, max_discharge_schedules=${maxDischargeSchedules} -- auto-adjusting`, 'info');
          const oldMax = maxDischargeSchedules;
          maxDischargeSchedules = storeCount;
          setState(dpConfig + 'max_discharge_schedules', storeCount, true);
-         log(`[SchedD] ✓ config.max_discharge_schedules auf ${storeCount} gesetzt`, 'info');
-         // Fehlende Datenpunkte für neue Slots anlegen
+         if (debug >= 1) log(`[SchedD] config.max_discharge_schedules set to ${storeCount}`, 'info');
+         // Create missing datapoints for new slots
          for (let i = oldMax; i < storeCount; i++) {
             await ensureStateAsync(dpSchedD + `${i}_json`,      '', { type: 'string',  role: 'json',  read: true, write: true });
-            await ensureStateAsync(dpSchedD + `${i}_startTime`, '', { type: 'string',  role: 'text',  read: true, write: true, desc: 'Startzeit als HH:MM' });
-            await ensureStateAsync(dpSchedD + `${i}_endTime`,   '', { type: 'string',  role: 'text',  read: true, write: true, desc: 'Endzeit als HH:MM' });
+            await ensureStateAsync(dpSchedD + `${i}_startTime`, '', { type: 'string',  role: 'text',  read: true, write: true, desc: 'Start time as HH:MM' });
+            await ensureStateAsync(dpSchedD + `${i}_endTime`,   '', { type: 'string',  role: 'text',  read: true, write: true, desc: 'End time as HH:MM' });
             await ensureStateAsync(dpSchedD + `${i}_timezone`,  '', { type: 'string',  role: 'text',  read: true, write: true });
-            await ensureStateAsync(dpSchedD + `${i}_days`,      '', { type: 'string',  role: 'json',  read: true, write: true, desc: 'Wochentage [1=Mo..7=So]' });
-            await ensureStateAsync(dpSchedD + `${i}_enabled`, true, { type: 'boolean', role: 'indicator', read: true, write: true, desc: 'Zeitplan aktiv (isEnabled)' });
-            log(`[SchedD] ✓ Datenpunkte für Slot ${i} angelegt`, 'info');
+            await ensureStateAsync(dpSchedD + `${i}_days`,      '', { type: 'string',  role: 'json',  read: true, write: true, desc: 'Days of week [1=Mon..7=Sun]' });
+            await ensureStateAsync(dpSchedD + `${i}_enabled`, true, { type: 'boolean', role: 'indicator', read: true, write: true, desc: 'Schedule active (isEnabled)' });
+            if (debug >= 2) log(`[SchedD] Datapoints for slot ${i} created`, 'info');
          }
       }
 
-      // Im ioBroker speichern (nur wenn Zeitpläne vorhanden)
+      // Save to ioBroker (only when schedules are present)
       await setStateAsync(dpSchedD + 'count',    storeCount, true);
       await setStateAsync(dpSchedD + 'raw_json', JSON.stringify(rbdSchedules), true);
 
@@ -878,35 +946,36 @@ class EnphaseCloudClient {
          await setStateAsync(dpSchedD + `${i}_timezone`,  s ? (s.timezone  || '') : '', true);
          await setStateAsync(dpSchedD + `${i}_days`,      s ? JSON.stringify(s.days || []) : '[]', true);
          await setStateAsync(dpSchedD + `${i}_enabled`,   s ? !!s.isEnabled : false, true);
+         if (debug >= 2 && s) log(`[SchedD]   [${i}] ${s.startTime}-${s.endTime} ${JSON.stringify(s.days)} (${s.scheduleId})`, 'info');
       }
 
-      log(`[SchedD] ✓ ${Math.min(storeCount, maxDischargeSchedules)} RBD-Zeitplan(e) im ioBroker gespeichert`, 'info');
-      if (debug >= 1) rbdSchedules.slice(0, maxDischargeSchedules).forEach((s, i) =>
-         log(`[SchedD]   [${i}] ${s.startTime}-${s.endTime} ${JSON.stringify(s.days)} (${s.scheduleId})`, 'info')
-      );
+      if (debug >= 1) log(`[SchedD] ${Math.min(storeCount, maxDischargeSchedules)} RBD schedule(s) stored in ioBroker`, 'info');
       return rbdSchedules;
    }
 
    // ------------------------------------------------
-   // restoreDischargeSchedules: fehlende RBD-Zeitpläne aus ioBroker wiederherstellen
-   // Vergleicht aktuelle Cloud-Zeitpläne mit gespeicherten Werten.
-   // Fehlende werden per POST neu angelegt.
-   // Sinnvoll nach changeBatteryDischargeSwitch(true), da der Server Zeitpläne löschen kann.
+   // restoreDischargeSchedules: restore missing RBD schedules from ioBroker
+   //
+   // Strategy: soft-delete all current cloud schedules via PUT isDeleted:true,
+   // then re-create all stored ioBroker schedules via POST.
+   // Useful after changeBatteryDischargeSwitch(true) because the server may delete schedules.
+   //
+   // @returns {void}
    // ------------------------------------------------
    async restoreDischargeSchedules() {
-      log('[SchedD] ▶ Stelle RBD-Zeitpläne wieder her (Delete-all → Create-all)', 'info');
+      log('[SchedD] Restoring RBD schedules (delete-all then create-all)', 'info');
       await this.ensureTokens();
 
-      // Gespeicherte Zeitpläne aus ioBroker laden
+      // Load stored schedules from ioBroker
       const storedRaw = getState(dpSchedD + 'raw_json').val;
       let storedSchedules = [];
       try { storedSchedules = JSON.parse(storedRaw || '[]'); } catch (e) { /* ignore */ }
 
       if (!storedSchedules || storedSchedules.length === 0) {
-         log('[SchedD] ⚠ Keine gespeicherten Entlade-Zeitpläne vorhanden – zuerst "read_discharge_schedules" ausführen!', 'warn');
+         log('[SchedD] No stored discharge schedules found -- run "read_discharge_schedules" first', 'warn');
          return;
       }
-      log(`[SchedD] ${storedSchedules.length} gespeicherte(r) Entlade-Zeitplan(e) werden wiederhergestellt`, 'info');
+      if (debug >= 1) log(`[SchedD] ${storedSchedules.length} stored discharge schedule(s) will be restored`, 'info');
 
       const baseHeaders = {
          'Content-Type':  'application/json',
@@ -918,7 +987,7 @@ class EnphaseCloudClient {
       };
       const schedUrl = `${ENLIGHTEN_BASE}/service/batteryConfig/api/v1/battery/sites/${this.batteryId}/schedules`;
 
-      // Schritt 1: Aktuelle Cloud-Zeitpläne lesen und alle soft-löschen
+      // Step 1: read current cloud schedules and soft-delete all of them
       const currentSchedules = await this.readDischargeSchedules();
       let deleted = 0;
       for (const s of currentSchedules) {
@@ -932,7 +1001,7 @@ class EnphaseCloudClient {
             isDeleted:    true,
             isEnabled:    s.isEnabled !== undefined ? s.isEnabled : true,
          };
-         log(`[SchedD] DELETE (soft) ${s.scheduleId} – ${s.startTime}-${s.endTime}`, 'info');
+         if (debug >= 2) log(`[SchedD] Soft-delete ${s.scheduleId} -- ${s.startTime}-${s.endTime}`, 'info');
          const delResp = await this._fetch(`${schedUrl}/${s.scheduleId}`, {
             method:  'PUT',
             headers: baseHeaders,
@@ -940,11 +1009,11 @@ class EnphaseCloudClient {
          });
          const delText = await delResp.text();
          if (delResp.ok) { deleted++; }
-         else { log(`[SchedD] ⚠ Soft-Delete fehlgeschlagen (HTTP ${delResp.status}): ${delText}`, 'warn'); }
+         else { log(`[SchedD] Soft-delete failed (HTTP ${delResp.status}): ${delText}`, 'warn'); }
       }
-      log(`[SchedD] ${deleted}/${currentSchedules.length} Zeitplan(e) gelöscht`, 'info');
+      if (debug >= 1) log(`[SchedD] ${deleted}/${currentSchedules.length} schedule(s) deleted`, 'info');
 
-      // Schritt 2: Alle gespeicherten Zeitpläne neu anlegen
+      // Step 2: re-create all stored schedules
       let restored = 0;
       for (const s of storedSchedules) {
          const payload = {
@@ -956,7 +1025,7 @@ class EnphaseCloudClient {
             isEnabled:    s.isEnabled !== undefined ? s.isEnabled : true,
          };
 
-         log(`[SchedD] POST – ${payload.startTime}-${payload.endTime} ${JSON.stringify(payload.days)}`, 'info');
+         if (debug >= 2) log(`[SchedD] POST -- ${payload.startTime}-${payload.endTime} ${JSON.stringify(payload.days)}`, 'info');
          const resp = await this._fetch(schedUrl, {
             method:  'POST',
             headers: baseHeaders,
@@ -964,31 +1033,35 @@ class EnphaseCloudClient {
          });
          const respText = await resp.text();
          if (resp.ok) {
-            log(`[SchedD] ✓ Zeitplan angelegt (HTTP ${resp.status}): ${respText.substring(0, 100)}`, 'info');
+            if (debug >= 2) log(`[SchedD] Schedule created (HTTP ${resp.status}): ${respText.substring(0, 100)}`, 'info');
             restored++;
          } else {
-            log(`[SchedD] ⚠ Fehler bei Zeitplan ${payload.startTime}-${payload.endTime}: HTTP ${resp.status} – ${respText}`, 'warn');
+            log(`[SchedD] Error creating schedule ${payload.startTime}-${payload.endTime}: HTTP ${resp.status} -- ${respText}`, 'warn');
          }
       }
 
-      log(`[SchedD] ✓ Wiederherstellung: ${restored}/${storedSchedules.length} Zeitplan(e) angelegt`, 'info');
+      if (debug >= 1) log(`[SchedD] Restore complete: ${restored}/${storedSchedules.length} schedule(s) created`, 'info');
 
-      // Aktualisierten Stand speichern
+      // Save updated state
       if (restored > 0) await this.readDischargeSchedules();
    }
 
    // ------------------------------------------------
-   // readChargeSchedules: Lade-Zeitpläne (CFG) von Enphase Cloud auslesen und im ioBroker speichern
-   // Verwendet denselben Schedules-Endpunkt wie readDischargeSchedules.
-   // Lade-Zeitpläne liegen unter parsed.cfg.details (scheduleType="CFG" oder ähnlich).
-   // @returns {Array} gefundene Lade-Zeitpläne
+   // readChargeSchedules: fetch charge schedules (CFG) from Enphase cloud and store in ioBroker
+   //
+   // Uses the same schedules endpoint as readDischargeSchedules.
+   // Charge schedules are under parsed.cfg.details (scheduleType="CFG" or similar).
+   // Falls back to parsed.dtg.details if cfg is empty.
+   // Auto-expands maxChargeSchedules if more schedules exist than configured.
+   //
+   // @returns {Array} Active charge schedules
    // ------------------------------------------------
    async readChargeSchedules() {
-      log('[SchedC] ▶ Lese Lade-Zeitpläne von Enphase Cloud', 'info');
+      log('[SchedC] Reading charge schedules from Enphase cloud', 'info');
       await this.ensureTokens();
 
       const url = `${ENLIGHTEN_BASE}/service/batteryConfig/api/v1/battery/sites/${this.batteryId}/schedules`;
-      log(`[SchedC] GET ${url}`, 'info');
+      if (debug >= 2) log(`[SchedC] GET ${url}`, 'info');
 
       const response = await this._fetch(url, {
          headers: {
@@ -999,56 +1072,56 @@ class EnphaseCloudClient {
          },
       });
       const text = await response.text();
-      if (!response.ok) throw new Error(`readChargeSchedules fehlgeschlagen: HTTP ${response.status} – ${text}`);
+      if (!response.ok) throw new Error(`readChargeSchedules failed: HTTP ${response.status} -- ${text}`);
 
-      // API-Antwortstruktur: { type:"BATTERY_SCHEDULES_CONFIG", rbd:{...}, cfg:{count:N, details:[...]}, dtg:{...} }
-      // Lade-Zeitpläne liegen unter parsed.cfg.details
+      // API response structure: { type:"BATTERY_SCHEDULES_CONFIG", rbd:{...}, cfg:{count:N, details:[...]}, dtg:{...} }
+      // Charge schedules are under parsed.cfg.details
       let cfgSchedules;
       try {
          const parsed = JSON.parse(text);
-         log(`[SchedC] Antwort-Typ: ${parsed.type}, cfg.count=${parsed.cfg?.count ?? 'n/a'}, dtg.count=${parsed.dtg?.count ?? 'n/a'}`, 'info');
-         if (debug >= 2) log(`[SchedC] Vollständige Antwort: ${text}`, 'info');
+         if (debug >= 1) log(`[SchedC] Response type: ${parsed.type}, cfg.count=${parsed.cfg?.count ?? 'n/a'}, dtg.count=${parsed.dtg?.count ?? 'n/a'}`, 'info');
+         if (debug >= 3) log(`[SchedC] Full response: ${text}`, 'info');
          cfgSchedules = (parsed.cfg && Array.isArray(parsed.cfg.details))
             ? parsed.cfg.details.filter(s => !s.isDeleted)
             : [];
          if (cfgSchedules.length === 0 && parsed.dtg && Array.isArray(parsed.dtg.details)) {
-            // Fallback: dtg-Sektion prüfen falls cfg leer ist
-            log('[SchedC] cfg leer – prüfe dtg-Sektion als Fallback', 'info');
+            // Fallback: check dtg section if cfg is empty
+            if (debug >= 2) log('[SchedC] cfg empty -- checking dtg section as fallback', 'info');
             cfgSchedules = parsed.dtg.details.filter(s => !s.isDeleted);
          }
       } catch (e) {
-         throw new Error(`readChargeSchedules: kein gültiges JSON – ${text.substring(0, 200)}`);
+         throw new Error(`readChargeSchedules: not valid JSON -- ${text.substring(0, 200)}`);
       }
 
       const storeCount = cfgSchedules.length;
-      log(`[SchedC] ${storeCount} aktive Lade-Zeitplan(e) gefunden`, 'info');
+      if (debug >= 1) log(`[SchedC] ${storeCount} active charge schedule(s) found`, 'info');
 
-      // Keine Zeitpläne bei Enphase → ioBroker-Konfiguration unverändert lassen
+      // No schedules at Enphase --> leave existing ioBroker config unchanged
       if (storeCount === 0) {
-         log('[SchedC] ℹ Enphase meldet 0 Lade-Zeitpläne – gespeicherte ioBroker-Konfiguration bleibt erhalten', 'info');
+         if (debug >= 1) log('[SchedC] Enphase reports 0 charge schedules -- stored ioBroker config remains unchanged', 'info');
          return cfgSchedules;
       }
 
-      // Mehr Zeitpläne als konfiguriert → max_charge_schedules erhöhen + fehlende DPs anlegen
+      // More schedules than configured --> raise max_charge_schedules + create missing datapoints
       if (storeCount > maxChargeSchedules) {
-         log(`[SchedC] ℹ ${storeCount} Lade-Zeitpläne gefunden, max_charge_schedules=${maxChargeSchedules} – passe automatisch an`, 'info');
+         log(`[SchedC] ${storeCount} charge schedules found, max_charge_schedules=${maxChargeSchedules} -- auto-adjusting`, 'info');
          const oldMax = maxChargeSchedules;
          maxChargeSchedules = storeCount;
          setState(dpConfig + 'max_charge_schedules', storeCount, true);
-         log(`[SchedC] ✓ config.max_charge_schedules auf ${storeCount} gesetzt`, 'info');
+         if (debug >= 1) log(`[SchedC] config.max_charge_schedules set to ${storeCount}`, 'info');
          for (let i = oldMax; i < storeCount; i++) {
             await ensureStateAsync(dpSchedC + `${i}_json`,      '', { type: 'string',  role: 'json',  read: true, write: true });
-            await ensureStateAsync(dpSchedC + `${i}_startTime`, '', { type: 'string',  role: 'text',  read: true, write: true, desc: 'Startzeit als HH:MM' });
-            await ensureStateAsync(dpSchedC + `${i}_endTime`,   '', { type: 'string',  role: 'text',  read: true, write: true, desc: 'Endzeit als HH:MM' });
+            await ensureStateAsync(dpSchedC + `${i}_startTime`, '', { type: 'string',  role: 'text',  read: true, write: true, desc: 'Start time as HH:MM' });
+            await ensureStateAsync(dpSchedC + `${i}_endTime`,   '', { type: 'string',  role: 'text',  read: true, write: true, desc: 'End time as HH:MM' });
             await ensureStateAsync(dpSchedC + `${i}_timezone`,  '', { type: 'string',  role: 'text',  read: true, write: true });
-            await ensureStateAsync(dpSchedC + `${i}_days`,      '', { type: 'string',  role: 'json',  read: true, write: true, desc: 'Wochentage [1=Mo..7=So]' });
-            await ensureStateAsync(dpSchedC + `${i}_limit`,    100, { type: 'number',  role: 'value', read: true, write: true, desc: 'Ladelimit in % (0–100)' });
-            await ensureStateAsync(dpSchedC + `${i}_enabled`, true, { type: 'boolean', role: 'indicator', read: true, write: true, desc: 'Zeitplan aktiv (isEnabled)' });
-            log(`[SchedC] ✓ Datenpunkte für Slot ${i} angelegt`, 'info');
+            await ensureStateAsync(dpSchedC + `${i}_days`,      '', { type: 'string',  role: 'json',  read: true, write: true, desc: 'Days of week [1=Mon..7=Sun]' });
+            await ensureStateAsync(dpSchedC + `${i}_limit`,    100, { type: 'number',  role: 'value', read: true, write: true, desc: 'Charge limit in % (0-100)' });
+            await ensureStateAsync(dpSchedC + `${i}_enabled`, true, { type: 'boolean', role: 'indicator', read: true, write: true, desc: 'Schedule active (isEnabled)' });
+            if (debug >= 2) log(`[SchedC] Datapoints for slot ${i} created`, 'info');
          }
       }
 
-      // Im ioBroker speichern
+      // Save to ioBroker
       await setStateAsync(dpSchedC + 'count',    storeCount, true);
       await setStateAsync(dpSchedC + 'raw_json', JSON.stringify(cfgSchedules), true);
 
@@ -1061,22 +1134,23 @@ class EnphaseCloudClient {
          await setStateAsync(dpSchedC + `${i}_days`,      s ? JSON.stringify(s.days || []) : '[]', true);
          await setStateAsync(dpSchedC + `${i}_limit`,     s && s.limit !== undefined ? s.limit : 100, true);
          await setStateAsync(dpSchedC + `${i}_enabled`,   s ? !!s.isEnabled : false, true);
+         if (debug >= 2 && s) log(`[SchedC]   [${i}] ${s.startTime}-${s.endTime} ${JSON.stringify(s.days)} (${s.scheduleId})`, 'info');
       }
 
-      log(`[SchedC] ✓ ${Math.min(storeCount, maxChargeSchedules)} Lade-Zeitplan(e) im ioBroker gespeichert`, 'info');
-      if (debug >= 1) cfgSchedules.slice(0, maxChargeSchedules).forEach((s, i) =>
-         log(`[SchedC]   [${i}] ${s.startTime}-${s.endTime} ${JSON.stringify(s.days)} (${s.scheduleId})`, 'info')
-      );
+      if (debug >= 1) log(`[SchedC] ${Math.min(storeCount, maxChargeSchedules)} charge schedule(s) stored in ioBroker`, 'info');
       return cfgSchedules;
    }
 
    // ------------------------------------------------
-   // restoreChargeSchedules: Lade-Zeitpläne aus ioBroker wiederherstellen
-   // Strategie: Alle vorhandenen Cloud-Zeitpläne per Soft-Delete löschen,
-   // dann alle gespeicherten ioBroker-Zeitpläne neu anlegen (POST).
+   // restoreChargeSchedules: restore charge schedules from ioBroker to Enphase cloud
+   //
+   // Strategy: soft-delete all current cloud charge schedules via PUT isDeleted:true,
+   // then re-create all stored ioBroker schedules via POST.
+   //
+   // @returns {void}
    // ------------------------------------------------
    async restoreChargeSchedules() {
-      log('[SchedC] ▶ Stelle Lade-Zeitpläne wieder her (delete-all → create-all)', 'info');
+      log('[SchedC] Restoring charge schedules (delete-all then create-all)', 'info');
       await this.ensureTokens();
 
       const storedRaw = getState(dpSchedC + 'raw_json').val;
@@ -1086,10 +1160,10 @@ class EnphaseCloudClient {
       } catch (e) { /* ignore */ }
 
       if (!storedSchedules || storedSchedules.length === 0) {
-         log('[SchedC] ⚠ Keine gespeicherten Lade-Zeitpläne vorhanden – zuerst "read_charge_schedules" ausführen!', 'warn');
+         log('[SchedC] No stored charge schedules found -- run "read_charge_schedules" first', 'warn');
          return;
       }
-      log(`[SchedC] ${storedSchedules.length} gespeicherte(r) Lade-Zeitplan(e) als Referenz`, 'info');
+      if (debug >= 1) log(`[SchedC] ${storedSchedules.length} stored charge schedule(s) as reference`, 'info');
 
       const baseHeaders = {
          'Content-Type':  'application/json',
@@ -1101,13 +1175,13 @@ class EnphaseCloudClient {
       };
       const schedUrl = `${ENLIGHTEN_BASE}/service/batteryConfig/api/v1/battery/sites/${this.batteryId}/schedules`;
 
-      // Schritt 1: Aktuelle Cloud-Zeitpläne ermitteln und per Soft-Delete löschen
+      // Step 1: read current cloud schedules and soft-delete all of them
       const currentSchedules = await this.readChargeSchedules();
-      log(`[SchedC] ${currentSchedules.length} vorhandene(r) Cloud-Zeitplan(e) werden gelöscht`, 'info');
+      if (debug >= 1) log(`[SchedC] ${currentSchedules.length} existing cloud schedule(s) will be deleted`, 'info');
       let deleted = 0;
       for (const s of currentSchedules) {
          const delUrl = `${schedUrl}/${s.scheduleId}`;
-         log(`[SchedC] Soft-Delete ${s.scheduleId} (${s.startTime}-${s.endTime})`, 'info');
+         if (debug >= 2) log(`[SchedC] Soft-delete ${s.scheduleId} (${s.startTime}-${s.endTime})`, 'info');
          const delResp = await this._fetch(delUrl, {
             method:  'PUT',
             headers: baseHeaders,
@@ -1115,11 +1189,11 @@ class EnphaseCloudClient {
          });
          const delText = await delResp.text();
          if (delResp.ok) { deleted++; }
-         else { log(`[SchedC] ⚠ Soft-Delete fehlgeschlagen (HTTP ${delResp.status}): ${delText}`, 'warn'); }
+         else { log(`[SchedC] Soft-delete failed (HTTP ${delResp.status}): ${delText}`, 'warn'); }
       }
-      log(`[SchedC] ${deleted}/${currentSchedules.length} Zeitplan(e) gelöscht`, 'info');
+      if (debug >= 1) log(`[SchedC] ${deleted}/${currentSchedules.length} schedule(s) deleted`, 'info');
 
-      // Schritt 2: Alle gespeicherten Zeitpläne neu anlegen
+      // Step 2: re-create all stored schedules
       let restored = 0;
       for (const s of storedSchedules) {
          const payload = {
@@ -1132,7 +1206,7 @@ class EnphaseCloudClient {
          };
          if (s.limit !== undefined) payload.limit = s.limit;
 
-         log(`[SchedC] POST – ${payload.startTime}-${payload.endTime} limit=${payload.limit ?? '-'}% ${JSON.stringify(payload.days)}`, 'info');
+         if (debug >= 2) log(`[SchedC] POST -- ${payload.startTime}-${payload.endTime} limit=${payload.limit ?? '-'}% ${JSON.stringify(payload.days)}`, 'info');
          const resp = await this._fetch(schedUrl, {
             method:  'POST',
             headers: baseHeaders,
@@ -1140,23 +1214,26 @@ class EnphaseCloudClient {
          });
          const respText = await resp.text();
          if (resp.ok) {
-            log(`[SchedC] ✓ Zeitplan angelegt (HTTP ${resp.status}): ${respText.substring(0, 100)}`, 'info');
+            if (debug >= 2) log(`[SchedC] Schedule created (HTTP ${resp.status}): ${respText.substring(0, 100)}`, 'info');
             restored++;
          } else {
-            log(`[SchedC] ⚠ Fehler bei Zeitplan ${payload.startTime}-${payload.endTime}: HTTP ${resp.status} – ${respText}`, 'warn');
+            log(`[SchedC] Error creating schedule ${payload.startTime}-${payload.endTime}: HTTP ${resp.status} -- ${respText}`, 'warn');
          }
       }
 
-      log(`[SchedC] ✓ Wiederherstellung: ${restored}/${storedSchedules.length} Lade-Zeitplan(e) angelegt`, 'info');
+      if (debug >= 1) log(`[SchedC] Restore complete: ${restored}/${storedSchedules.length} charge schedule(s) created`, 'info');
       if (restored > 0) await this.readChargeSchedules();
    }
 
    // ------------------------------------------------
-   // deleteDischargeSchedules: Alle Entlade-Zeitpläne (RBD) in der Enphase Cloud löschen
-   // Soft-Delete per PUT mit isDeleted:true
+   // deleteDischargeSchedules: soft-delete all RBD discharge schedules in Enphase cloud
+   //
+   // Sends PUT isDeleted:true for each active schedule, then clears the ioBroker datapoints.
+   //
+   // @returns {void}
    // ------------------------------------------------
    async deleteDischargeSchedules() {
-      log('[SchedD] ▶ Lösche alle Entlade-Zeitpläne in der Enphase Cloud', 'info');
+      log('[SchedD] Deleting all discharge schedules in Enphase cloud', 'info');
       await this.ensureTokens();
 
       const baseHeaders = {
@@ -1171,7 +1248,7 @@ class EnphaseCloudClient {
 
       const currentSchedules = await this.readDischargeSchedules();
       if (currentSchedules.length === 0) {
-         log('[SchedD] ℹ Keine aktiven Entlade-Zeitpläne in der Cloud – leere ioBroker-States', 'info');
+         if (debug >= 1) log('[SchedD] No active discharge schedules in cloud -- clearing ioBroker states', 'info');
       }
 
       let deleted = 0;
@@ -1186,7 +1263,7 @@ class EnphaseCloudClient {
             isEnabled:    s.isEnabled !== undefined ? s.isEnabled : true,
             isDeleted:    true,
          };
-         log(`[SchedD] DELETE (soft) ${s.scheduleId} – ${s.startTime}-${s.endTime}`, 'info');
+         if (debug >= 2) log(`[SchedD] Soft-delete ${s.scheduleId} -- ${s.startTime}-${s.endTime}`, 'info');
          const resp = await this._fetch(`${schedUrl}/${s.scheduleId}`, {
             method:  'PUT',
             headers: baseHeaders,
@@ -1194,11 +1271,11 @@ class EnphaseCloudClient {
          });
          const text = await resp.text();
          if (resp.ok) { deleted++; }
-         else { log(`[SchedD] ⚠ Soft-Delete fehlgeschlagen (HTTP ${resp.status}): ${text}`, 'warn'); }
+         else { log(`[SchedD] Soft-delete failed (HTTP ${resp.status}): ${text}`, 'warn'); }
       }
-      log(`[SchedD] ✓ ${deleted}/${currentSchedules.length} Entlade-Zeitplan(e) gelöscht`, 'info');
+      if (debug >= 1) log(`[SchedD] ${deleted}/${currentSchedules.length} discharge schedule(s) deleted`, 'info');
 
-      // ioBroker-Datenpunkte neutralisieren (nur bei manueller Löschung)
+      // Clear ioBroker datapoints (only on manual deletion)
       await setStateAsync(dpSchedD + 'count',    0,    true);
       await setStateAsync(dpSchedD + 'raw_json', '[]', true);
       for (let i = 0; i < maxDischargeSchedules; i++) {
@@ -1209,15 +1286,18 @@ class EnphaseCloudClient {
          await setStateAsync(dpSchedD + `${i}_days`,      '[]', true);
          await setStateAsync(dpSchedD + `${i}_enabled`,   false, true);
       }
-      log('[SchedD] ✓ ioBroker-Datenpunkte für Entlade-Zeitpläne geleert', 'info');
+      if (debug >= 1) log('[SchedD] ioBroker datapoints for discharge schedules cleared', 'info');
    }
 
    // ------------------------------------------------
-   // deleteChargeSchedules: Alle Lade-Zeitpläne (CFG) in der Enphase Cloud löschen
-   // Soft-Delete per PUT mit isDeleted:true
+   // deleteChargeSchedules: soft-delete all CFG charge schedules in Enphase cloud
+   //
+   // Sends PUT isDeleted:true for each active schedule, then clears the ioBroker datapoints.
+   //
+   // @returns {void}
    // ------------------------------------------------
    async deleteChargeSchedules() {
-      log('[SchedC] ▶ Lösche alle Lade-Zeitpläne in der Enphase Cloud', 'info');
+      log('[SchedC] Deleting all charge schedules in Enphase cloud', 'info');
       await this.ensureTokens();
 
       const baseHeaders = {
@@ -1232,7 +1312,7 @@ class EnphaseCloudClient {
 
       const currentSchedules = await this.readChargeSchedules();
       if (currentSchedules.length === 0) {
-         log('[SchedC] ℹ Keine aktiven Lade-Zeitpläne in der Cloud – leere ioBroker-States', 'info');
+         if (debug >= 1) log('[SchedC] No active charge schedules in cloud -- clearing ioBroker states', 'info');
       }
 
       let deleted = 0;
@@ -1247,7 +1327,7 @@ class EnphaseCloudClient {
             isEnabled:    s.isEnabled !== undefined ? s.isEnabled : true,
             isDeleted:    true,
          };
-         log(`[SchedC] DELETE (soft) ${s.scheduleId} – ${s.startTime}-${s.endTime}`, 'info');
+         if (debug >= 2) log(`[SchedC] Soft-delete ${s.scheduleId} -- ${s.startTime}-${s.endTime}`, 'info');
          const resp = await this._fetch(`${schedUrl}/${s.scheduleId}`, {
             method:  'PUT',
             headers: baseHeaders,
@@ -1255,11 +1335,11 @@ class EnphaseCloudClient {
          });
          const text = await resp.text();
          if (resp.ok) { deleted++; }
-         else { log(`[SchedC] ⚠ Soft-Delete fehlgeschlagen (HTTP ${resp.status}): ${text}`, 'warn'); }
+         else { log(`[SchedC] Soft-delete failed (HTTP ${resp.status}): ${text}`, 'warn'); }
       }
-      log(`[SchedC] ✓ ${deleted}/${currentSchedules.length} Lade-Zeitplan(e) gelöscht`, 'info');
+      if (debug >= 1) log(`[SchedC] ${deleted}/${currentSchedules.length} charge schedule(s) deleted`, 'info');
 
-      // ioBroker-Datenpunkte neutralisieren (nur bei manueller Löschung)
+      // Clear ioBroker datapoints (only on manual deletion)
       await setStateAsync(dpSchedC + 'count',    0,    true);
       await setStateAsync(dpSchedC + 'raw_json', '[]', true);
       for (let i = 0; i < maxChargeSchedules; i++) {
@@ -1271,14 +1351,17 @@ class EnphaseCloudClient {
          await setStateAsync(dpSchedC + `${i}_limit`,     100,  true);
          await setStateAsync(dpSchedC + `${i}_enabled`,   false, true);
       }
-      log('[SchedC] ✓ ioBroker-Datenpunkte für Lade-Zeitpläne geleert', 'info');
+      if (debug >= 1) log('[SchedC] ioBroker datapoints for charge schedules cleared', 'info');
    }
 
    // ------------------------------------------------
-   // getMqttSignedUrl: Signierte WebSocket-URL für AWS IoT MQTT holen
+   // getMqttSignedUrl: fetch a signed WebSocket URL for AWS IoT MQTT
+   //
+   // @returns {object} mqttInfo object with aws_iot_endpoint, aws_authorizer,
+   //                   aws_token_key, aws_token_value, aws_digest, topic
    // ------------------------------------------------
    async getMqttSignedUrl() {
-      log('[MQTT] Rufe MQTT Signed URL ab', 'info');
+      if (debug >= 2) log('[MQTT] Fetching MQTT signed URL', 'info');
       const url = `${ENLIGHTEN_BASE}/service/batteryConfig/api/v1/mqttSignedUrl/${this.batteryId}`;
       const response = await this._fetch(url, {
          headers: {
@@ -1289,22 +1372,26 @@ class EnphaseCloudClient {
          },
       });
       const text = await response.text();
-      log(`[MQTT] Signed URL Response (HTTP ${response.status}): ${text}`, 'info');
-      if (!response.ok) throw new Error(`getMqttSignedUrl fehlgeschlagen: HTTP ${response.status} – ${text}`);
+      if (debug >= 2) log(`[MQTT] Signed URL response (HTTP ${response.status})`, 'info');
+      if (debug >= 3) log(`[MQTT] Signed URL response body: ${text}`, 'info');
+      if (!response.ok) throw new Error(`getMqttSignedUrl failed: HTTP ${response.status} -- ${text}`);
       return JSON.parse(text);
    }
 
    // ------------------------------------------------
-   // changeBatteryViaMqtt: RBD-Einstellung für Systeme mit supportsMqtt:true
-   // Analyse des Browser-Quellcodes (battery-profile-ui) ergab:
-   //   1. WS-URL hat KEINE Query-Parameter – die Auth geht als MQTT-Username!
+   // changeBatteryViaMqtt: send RBD setting for systems with supportsMqtt:true
+   //
+   // Key insight from browser source analysis (battery-profile-ui):
+   //   1. WS URL has NO query parameters -- auth goes as MQTT username
    //   2. MQTT username = "?x-amz-customauthorizer-name=...&enph_token=...&site-id=...&signature=...&env=..."
-   //   3. MQTT 3.1.1 (Level 4), kein Passwort
-   //   4. Origin = BATTERY_UI_BASE (nicht enlighten!)
-   //   5. Browser subscribt auf Response-Topic, sendet Befehl per REST PUT
-   //   6. Wir versuchen zusätzlich REST PUT auf battery-profile-ui-Endpunkt
-   // @param {boolean} enable
-   // @param {object}  mqttInfo  – Rückgabe von getMqttSignedUrl()
+   //   3. MQTT 3.1.1 (level 4), no password
+   //   4. Origin = BATTERY_UI_BASE (not enlighten)
+   //   5. Browser subscribes to response topic, sends command via REST PUT
+   //   6. We also attempt REST PUT on the battery-profile-ui endpoint
+   //
+   // @param {boolean} enable    - true = restrict discharge active
+   // @param {object}  mqttInfo  - return value from getMqttSignedUrl()
+   // @returns {Promise<boolean>} resolves true on success
    // ------------------------------------------------
    async changeBatteryViaMqtt(enable, mqttInfo) {
       let mqtt;
@@ -1312,16 +1399,16 @@ class EnphaseCloudClient {
          // @ts-ignore
          mqtt = require('mqtt');
       } catch (e) {
-         throw new Error('mqtt-Paket nicht verfügbar – bitte installieren: npm install mqtt');
+         throw new Error('mqtt package not available -- install with: npm install mqtt');
       }
 
-      // mqttInfo-Felder:
-      //   aws_iot_endpoint  → MQTT-Broker-Host
-      //   aws_authorizer    → Custom-Authorizer-Name
-      //   aws_token_key     → Query-Param-Name (z.B. "enph_token")
-      //   aws_token_value   → Session-Token-Wert
-      //   aws_digest        → Base64-Signatur (wird encodeURIComponent-kodiert)
-      //   topic             → Response-Stream-Topic (v1/server/response-stream/{sessionId})
+      // mqttInfo fields:
+      //   aws_iot_endpoint  --> MQTT broker host
+      //   aws_authorizer    --> custom authorizer name
+      //   aws_token_key     --> query param name (e.g. "enph_token")
+      //   aws_token_value   --> session token value
+      //   aws_digest        --> base64 signature (encodeURIComponent-encoded)
+      //   topic             --> response stream topic (v1/server/response-stream/{sessionId})
       const endpoint      = mqttInfo.aws_iot_endpoint;
       const authorizer    = mqttInfo.aws_authorizer;
       const tokenKey      = mqttInfo.aws_token_key;
@@ -1329,21 +1416,21 @@ class EnphaseCloudClient {
       const digest        = mqttInfo.aws_digest;
       const responseTopic = mqttInfo.topic;
 
-      if (!endpoint) throw new Error(`aws_iot_endpoint fehlt in mqttInfo: ${JSON.stringify(Object.keys(mqttInfo))}`);
+      if (!endpoint) throw new Error(`aws_iot_endpoint missing in mqttInfo: ${JSON.stringify(Object.keys(mqttInfo))}`);
 
-      // Session-ID aus dem Response-Topic
+      // Session ID from the response topic
       const sessionId = responseTopic ? responseTopic.split('/').pop() : '';
-      log(`[MQTT] Session-ID: ${sessionId}`, 'info');
+      if (debug >= 2) log(`[MQTT] Session ID: ${sessionId}`, 'info');
 
-      // Client-ID im Paho-MQTT-Stil (Browser: bp-paho-mqtt-{4 Zufallszeichen})
+      // Client ID in Paho-MQTT style (browser: bp-paho-mqtt-{4 random chars})
       const mqttClientId = `bp-paho-mqtt-${Math.random().toString(36).substring(2, 6)}`;
-      log(`[MQTT] Client-ID: ${mqttClientId}`, 'info');
+      if (debug >= 2) log(`[MQTT] Client ID: ${mqttClientId}`, 'info');
 
-      // SCHLÜSSEL-ERKENNTNIS (aus Battery-UI-JS-Analyse):
-      // WS-URL hat KEINE Query-Parameter!
-      // Die Auth-Daten gehen als MQTT-username (Format wie Paho es baut):
+      // KEY INSIGHT (from battery-UI JS analysis):
+      // WS URL has NO query parameters!
+      // Auth data goes as MQTT username (format as Paho builds it):
       //   "?x-amz-customauthorizer-name=AUTHORIZER&TOKEN_KEY=TOKEN_VALUE&site-id=SITE_ID&x-amz-customauthorizer-signature=ENCODED_DIGEST&env=production"
-      // Digest wird encodeURIComponent-kodiert, alle anderen Werte NICHT.
+      // Digest is encodeURIComponent-encoded, all other values are NOT.
       const wsUrl       = `wss://${endpoint}/mqtt`;
       const mqttUsername = `?x-amz-customauthorizer-name=${authorizer}` +
          `&${tokenKey}=${tokenValue}` +
@@ -1351,13 +1438,13 @@ class EnphaseCloudClient {
          `&x-amz-customauthorizer-signature=${encodeURIComponent(digest)}` +
          `&env=production`;
 
-      log(`[MQTT] WSS URL: ${wsUrl}  (keine Query-Params!)`, 'info');
-      log(`[MQTT] MQTT username: ?x-amz-customauthorizer-name=${authorizer}&${tokenKey}=***&site-id=${this.batteryId}&...`, 'info');
-      log(`[MQTT] Response-Topic (subscribe): ${responseTopic}`, 'info');
+      if (debug >= 3) log(`[MQTT] WSS URL: ${wsUrl}  (no query params)`, 'info');
+      if (debug >= 3) log(`[MQTT] MQTT username: ?x-amz-customauthorizer-name=${authorizer}&${tokenKey}=***&site-id=${this.batteryId}&...`, 'info');
+      if (debug >= 2) log(`[MQTT] Response topic (subscribe): ${responseTopic}`, 'info');
 
-      // MQTT-Verbindung aufbauen
+      // Establish MQTT connection
       return new Promise((resolve, reject) => {
-         log('[MQTT] Starte MQTT-Verbindung (MQTT 3.1.1, Auth via username)...', 'info');
+         if (debug >= 2) log('[MQTT] Starting MQTT connection (MQTT 3.1.1, auth via username)', 'info');
 
          let settled = false;
          const settle = (fn, val) => {
@@ -1373,8 +1460,8 @@ class EnphaseCloudClient {
                clientId:        mqttClientId,
                protocolVersion: 4,       // MQTT 3.1.1
                protocolId:      'MQTT',
-               username:        mqttUsername, // Auth als MQTT-username!
-               // kein password
+               username:        mqttUsername, // auth as MQTT username
+               // no password
                reconnectPeriod: 0,
                connectTimeout:  20000,
                keepalive:       60,
@@ -1385,33 +1472,33 @@ class EnphaseCloudClient {
                },
             });
          } catch (e) {
-            reject(new Error(`mqtt.connect() Fehler: ${e instanceof Error ? e.message : String(e)}`));
+            reject(new Error(`mqtt.connect() error: ${e instanceof Error ? e.message : String(e)}`));
             return;
          }
-         log('[MQTT] Warte auf connect-Event...', 'info');
+         if (debug >= 2) log('[MQTT] Waiting for connect event', 'info');
 
          const timer = setTimeout(() => {
             log('[MQTT] Timeout (20s)', 'warn');
             client.end(true);
-            settle(reject, new Error('MQTT Verbindungs-Timeout (20s)'));
+            settle(reject, new Error('MQTT connection timeout (20s)'));
          }, 20000);
 
          client.on('connect', async () => {
-            log('[MQTT] Verbunden ✓ (CONNACK 0x00)', 'info');
+            if (debug >= 2) log('[MQTT] Connected (CONNACK 0x00)', 'info');
 
-            // Response-Topic abonnieren (Browser macht das auch)
+            // Subscribe to response topic (browser does this too)
             client.subscribe(responseTopic, { qos: 1 }, (subErr) => {
-               if (subErr) log(`[MQTT] Subscribe-Fehler: ${subErr.message}`, 'warn');
-               else        log(`[MQTT] Abonniert: ${responseTopic}`, 'info');
+               if (subErr) log(`[MQTT] Subscribe error: ${subErr.message}`, 'warn');
+               else if (debug >= 2) log(`[MQTT] Subscribed: ${responseTopic}`, 'info');
             });
 
-            // Batterie-Einstellung per REST PUT senden (wie Browser es macht)
-            // API-Backend ist auf enlighten.enphaseenergy.com (window.build_domain_api aus battery-profile-ui HTML)
-            // Browser verwendet SET_BATTERY_CONFIG = "/batterySettings/@SITE_ID?@USER_ID" (KEIN source=enho!)
+            // Send battery setting via REST PUT (as browser does it)
+            // API backend is on enlighten.enphaseenergy.com (window.build_domain_api from battery-profile-ui HTML)
+            // Browser uses SET_BATTERY_CONFIG = "/batterySettings/@SITE_ID?@USER_ID" (no source=enho)
             const batteryUrl = `${ENLIGHTEN_BASE}/service/batteryConfig/api/v1/batterySettings/${this.batteryId}?userId=${this.userId}`;
             const payload    = JSON.stringify({ rbdControl: { enabled: enable } });
-            log(`[MQTT] REST PUT ${batteryUrl}`, 'info');
-            log(`[MQTT] REST Payload: ${payload}`, 'info');
+            if (debug >= 2) log(`[MQTT] REST PUT ${batteryUrl}`, 'info');
+            if (debug >= 2) log(`[MQTT] REST payload: ${payload}`, 'info');
 
             try {
                const restHeaders = {
@@ -1424,57 +1511,59 @@ class EnphaseCloudClient {
                };
                const restResp = await this._fetch(batteryUrl, { method: 'PUT', headers: restHeaders, body: payload });
                const restBody = await restResp.text();
-               log(`[MQTT] REST Antwort: HTTP ${restResp.status} – ${restBody}`, restResp.ok ? 'info' : 'warn');
+               if (debug >= 1) log(`[MQTT] REST response: HTTP ${restResp.status}`, restResp.ok ? 'info' : 'warn');
+               if (debug >= 2) log(`[MQTT] REST response body: ${restBody}`, 'info');
 
                if (restResp.ok) {
-                  // 10s warten für mögliche MQTT-Antwort, dann resolve
+                  // Wait 10s for possible MQTT response, then resolve
                   setTimeout(() => { client.end(); settle(resolve, true); }, 10000);
                } else if (restResp.status === 403) {
-                  // Token erneuern und nochmal versuchen
-                  log('[MQTT] REST 403 – erneuere Tokens und wiederhole', 'warn');
+                  // Renew tokens and retry
+                  log('[MQTT] REST 403 -- renewing tokens and retrying', 'warn');
                   await this.ensureTokens(true);
                   restHeaders['e-auth-token'] = this.jwtToken;
                   restHeaders['x-xsrf-token'] = this.xsrfToken;
                   const restResp2 = await this._fetch(batteryUrl, { method: 'PUT', headers: restHeaders, body: payload });
                   const restBody2 = await restResp2.text();
-                  log(`[MQTT] REST Wiederholung: HTTP ${restResp2.status} – ${restBody2}`, restResp2.ok ? 'info' : 'warn');
+                  if (debug >= 1) log(`[MQTT] REST retry: HTTP ${restResp2.status}`, restResp2.ok ? 'info' : 'warn');
+                  if (debug >= 2) log(`[MQTT] REST retry body: ${restBody2}`, 'info');
                   client.end();
                   if (restResp2.ok) settle(resolve, true);
-                  else settle(reject, new Error(`REST PUT fehlgeschlagen: HTTP ${restResp2.status} – ${restBody2}`));
+                  else settle(reject, new Error(`REST PUT failed: HTTP ${restResp2.status} -- ${restBody2}`));
                } else {
                   client.end();
-                  settle(reject, new Error(`REST PUT fehlgeschlagen: HTTP ${restResp.status} – ${restBody}`));
+                  settle(reject, new Error(`REST PUT failed: HTTP ${restResp.status} -- ${restBody}`));
                }
             } catch (restErr) {
-               log(`[MQTT] REST Fehler: ${restErr instanceof Error ? restErr.message : String(restErr)}`, 'warn');
+               log(`[MQTT] REST error: ${restErr instanceof Error ? restErr.message : String(restErr)}`, 'warn');
                client.end();
                settle(reject, restErr instanceof Error ? restErr : new Error(String(restErr)));
             }
          });
 
          client.on('message', (topic, msg) => {
-            log(`[MQTT] Server-Antwort auf ${topic}: ${msg.toString()}`, 'info');
-            // Bei profile_change_response sofort resolve
+            if (debug >= 2) log(`[MQTT] Server response on ${topic}: ${msg.toString()}`, 'info');
+            // On profile_change_response resolve immediately
             try {
                const parsed = JSON.parse(msg.toString());
                if (parsed.messageType === 'profile_change_response' ||
                    parsed.messageType === 'storm_change_response') {
-                  log('[MQTT] ✓ Änderung bestätigt per MQTT', 'info');
+                  if (debug >= 1) log('[MQTT] Change confirmed via MQTT', 'info');
                   client.end();
                   settle(resolve, true);
                }
-            } catch (e) { /* kein JSON – ignorieren */ }
+            } catch (e) { /* not JSON -- ignore */ }
          });
 
          client.on('error', (err) => {
             const msg = err instanceof Error ? err.message : String(err);
-            log(`[MQTT] Fehler: ${msg}`, 'warn');
-            settle(reject, new Error(`MQTT Verbindungsfehler: ${msg}`));
+            log(`[MQTT] Error: ${msg}`, 'warn');
+            settle(reject, new Error(`MQTT connection error: ${msg}`));
          });
 
          client.on('close', () => {
-            log('[MQTT] Verbindung geschlossen', 'info');
-            settle(reject, new Error('MQTT Verbindung geschlossen (vor connect)'));
+            if (debug >= 2) log('[MQTT] Connection closed', 'info');
+            settle(reject, new Error('MQTT connection closed (before connect)'));
          });
 
          client.on('offline', () => {
@@ -1484,7 +1573,11 @@ class EnphaseCloudClient {
    }
 
    // ------------------------------------------------
-   // Cache laden / speichern
+   // loadCache / _saveCache: persist tokens to a JSON file on disk
+   //
+   // loadCache() reads jwt, jwtExp, xsrf, userId, batteryId, and cookies
+   //             from CACHE_FILE and populates the instance fields.
+   // _saveCache() writes the current state back to CACHE_FILE.
    // ------------------------------------------------
    loadCache() {
       try {
@@ -1496,10 +1589,10 @@ class EnphaseCloudClient {
             this.userId    = data.userId    || null;
             this.batteryId = data.batteryId || null;
             if (data.cookies) this.cookieJar.fromJSON(data.cookies);
-            if (debug >= 1) log('[Cache] Tokens aus Datei-Cache geladen', 'info');
+            if (debug >= 2) log('[Cache] Tokens loaded from file cache', 'info');
          }
       } catch (e) {
-         if (debug >= 1) log(`[Cache] Fehler beim Laden: ${e instanceof Error ? e.message : String(e)}`, 'warn');
+         if (debug >= 2) log(`[Cache] Load error: ${e instanceof Error ? e.message : String(e)}`, 'warn');
       }
    }
 
@@ -1515,14 +1608,18 @@ class EnphaseCloudClient {
             batteryId: this.batteryId,
             cookies:   this.cookieJar.toJSON(),
          }, null, 2), 'utf8');
-         if (debug >= 2) log('[Cache] Tokens gespeichert', 'info');
+         if (debug >= 2) log('[Cache] Tokens saved', 'info');
       } catch (e) {
-         if (debug >= 1) log(`[Cache] Fehler beim Speichern: ${e instanceof Error ? e.message : String(e)}`, 'warn');
+         if (debug >= 2) log(`[Cache] Save error: ${e instanceof Error ? e.message : String(e)}`, 'warn');
       }
    }
 
    // ------------------------------------------------
-   // States lesen / schreiben
+   // _saveToStates / loadFromStates: persist tokens to ioBroker datapoints
+   //
+   // _saveToStates() writes jwt_token, jwt_expires, xsrf_token, user_id,
+   //                 battery_id, and last_login to ioBroker status states.
+   // loadFromStates() reads those values back and populates the instance fields.
    // ------------------------------------------------
    async _saveToStates() {
       try {
@@ -1532,8 +1629,9 @@ class EnphaseCloudClient {
          if (this.userId)     setState(dpStatus + 'user_id',     this.userId,    true);
          if (this.batteryId)  setState(dpStatus + 'battery_id',  this.batteryId, true);
          setState(dpStatus + 'last_login', new Date().toISOString(), true);
+         if (debug >= 2) log('[States] Tokens saved to ioBroker states', 'info');
       } catch (e) {
-         if (debug >= 1) log(`[States] Fehler: ${e instanceof Error ? e.message : String(e)}`, 'warn');
+         if (debug >= 2) log(`[States] Error: ${e instanceof Error ? e.message : String(e)}`, 'warn');
       }
    }
 
@@ -1546,106 +1644,107 @@ class EnphaseCloudClient {
          this.batteryId = readVal(dpStatus + 'battery_id') || this.batteryId;
          const expStr   = readVal(dpStatus + 'jwt_expires');
          if (expStr) this.jwtExp = Math.floor(new Date(expStr).getTime() / 1000);
-         if (debug >= 1) log('[States] Tokens aus ioBroker States geladen', 'info');
+         if (debug >= 2) log('[States] Tokens loaded from ioBroker states', 'info');
       } catch (e) {
-         if (debug >= 1) log(`[States] Fehler beim Lesen: ${e instanceof Error ? e.message : String(e)}`, 'warn');
+         if (debug >= 2) log(`[States] Read error: ${e instanceof Error ? e.message : String(e)}`, 'warn');
       }
    }
 }
 
 // -------------------------------------------------------------------------------------------------------------------
-// Hauptprogramm
+// Main program
 // -------------------------------------------------------------------------------------------------------------------
 
-// Credentials aus ioBroker States lesen
+// Read credentials from ioBroker states
 const email    = getState(dpConfig + 'email').val    || '';
 const password = getState(dpConfig + 'password').val || '';
 
 if (!email || !password) {
-   log('Enphase Email und/oder Passwort nicht konfiguriert!', 'warn');
-   log(`  Bitte eintragen in: ${dpConfig}email  und  ${dpConfig}password`, 'warn');
+   log('Enphase email and/or password not configured', 'warn');
+   log(`  Please set: ${dpConfig}email  and  ${dpConfig}password`, 'warn');
 }
 
-// Client instanziieren
+// Instantiate client
 const enphaseClient = new EnphaseCloudClient(email, password);
 
-// Tokens aus dem letzten Run laden (Datei-Cache hat Vorrang vor States)
+// Load tokens from previous run (file cache takes precedence over states)
 enphaseClient.loadFromStates();
 enphaseClient.loadCache();
 
-// FIX: login() ist async – muss in einer async-IIFE aufgerufen werden.
-// Vorher: enphaseClient.login() ohne await → Promise ignoriert, Fehler verschluckt.
-// Jetzt:  Fehler werden korrekt geloggt, Script läuft danach weiter.
+// Fix: login() is async -- must be called inside an async IIFE.
+// Previously: enphaseClient.login() without await --> Promise ignored, errors swallowed.
+// Now: errors are correctly logged, script continues afterwards.
 (async () => {
    if (email && password) {
       try {
          if (!enphaseClient.checkToken()) {
             await enphaseClient.login();
          } else {
-            if (debug >= 1) log('[Init] Gültiger Token aus Cache – kein Neulogin nötig', 'info');
+            if (debug >= 1) log('[Init] Valid token from cache -- no re-login needed', 'info');
          }
-         // Nach Login: aktuellen Cloud-Status lesen und States synchronisieren
+         // After login: read current cloud status and synchronize states
          await enphaseClient.readBatteryDischargeStatus();
          await enphaseClient.readChargeFromGrid();
          await enphaseClient.readDischargeSchedules();
          await enphaseClient.readChargeSchedules();
+         if (debug >= 1) log('[Init] Startup sync complete', 'info');
       } catch (err) {
-         log(`[Init] Startup fehlgeschlagen: ${err instanceof Error ? err.message : String(err)}`, 'error');
+         log(`[Init] Startup failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
       }
    }
 })();
 
 // -------------------------------------------------------------------------------------------------------------------
-// State-Subscription: Reaktion auf Schalterwechsel
+// State subscriptions: react to switch changes
 // -------------------------------------------------------------------------------------------------------------------
 on({ id: dpControl + 'battery_discharge_restrict', change: 'ne', ack: false }, async (obj) => {
    const enable = !!obj.state.val;
-   if (debug >= 1) log(`[Trigger] Batterieentladung einschränken -> ${enable}`, 'info');
+   if (debug >= 1) log(`[Trigger] Restrict battery discharge -> ${enable}`, 'info');
 
    if (!enphaseClient.email || !enphaseClient.password) {
-      log('[Fehler] Keine Credentials konfiguriert – Aktion abgebrochen', 'error');
+      log('[Error] No credentials configured -- action aborted', 'error');
       return;
    }
 
    try {
       await enphaseClient.changeBatteryDischargeSwitch(enable);
    } catch (err) {
-      log(`[Fehler] changeBatteryDischargeSwitch: ${err instanceof Error ? err.message : String(err)}`, 'error');
-      // State zurücksetzen auf den alten Wert (Fehlerfall)
+      log(`[Error] changeBatteryDischargeSwitch: ${err instanceof Error ? err.message : String(err)}`, 'error');
+      // Reset state to previous value on error
       setState(dpControl + 'battery_discharge_restrict', !enable, true);
    }
 });
 
 // -------------------------------------------------------------------------------------------------------------------
-// State-Subscription: Manueller Status-Abruf über read_battery_status Datenpunkt
+// State subscription: manual status read via read_battery_status datapoint
 // -------------------------------------------------------------------------------------------------------------------
 on({ id: dpControl + 'read_battery_status', change: 'any', ack: false }, async (obj) => {
-   if (!obj.state.val) return; // nur bei true auslösen
-   if (debug >= 1) log('[Trigger] Manueller Status-Abruf ausgelöst', 'info');
+   if (!obj.state.val) return; // only trigger on true
+   if (debug >= 1) log('[Trigger] Manual battery status read triggered', 'info');
 
    if (!enphaseClient.email || !enphaseClient.password) {
-      log('[Fehler] Keine Credentials konfiguriert – Aktion abgebrochen', 'error');
+      log('[Error] No credentials configured -- action aborted', 'error');
       return;
    }
 
    try {
       await enphaseClient.readBatteryDischargeStatus();
    } catch (err) {
-      log(`[Fehler] readBatteryDischargeStatus: ${err instanceof Error ? err.message : String(err)}`, 'error');
+      log(`[Error] readBatteryDischargeStatus: ${err instanceof Error ? err.message : String(err)}`, 'error');
    } finally {
-      setState(dpControl + 'read_battery_status', false, true); // Button zurücksetzen
+      setState(dpControl + 'read_battery_status', false, true); // reset button
    }
 });
 
 // -------------------------------------------------------------------------------------------------------------------
-// State-Subscription: Netzlade-Status manuell abrufen
+// State subscription: manually fetch grid-charge status
 // -------------------------------------------------------------------------------------------------------------------
 on({ id: dpControl + 'read_charge_from_grid_status', change: 'any', ack: false }, async (obj) => {
    if (!obj.state.val) return;
-   if (debug >= 1) log('[Trigger] Manueller Netzlade-Status-Abruf ausgelöst', 'info');
+   if (debug >= 1) log('[Trigger] Manual grid-charge status read triggered', 'info');
 
    if (!enphaseClient.email || !enphaseClient.password) {
-      log('[Fehler] Keine Credentials konfiguriert – Aktion abgebrochen', 'error');
+      log('[Error] No credentials configured -- action aborted', 'error');
       setState(dpControl + 'read_charge_from_grid_status', false, true);
       return;
    }
@@ -1653,112 +1752,112 @@ on({ id: dpControl + 'read_charge_from_grid_status', change: 'any', ack: false }
    try {
       await enphaseClient.readChargeFromGrid();
    } catch (err) {
-      log(`[Fehler] readChargeFromGrid: ${err instanceof Error ? err.message : String(err)}`, 'error');
+      log(`[Error] readChargeFromGrid: ${err instanceof Error ? err.message : String(err)}`, 'error');
    } finally {
       setState(dpControl + 'read_charge_from_grid_status', false, true);
    }
 });
 
 // -------------------------------------------------------------------------------------------------------------------
-// State-Subscription: "Laden über Stromnetz" Schalter
+// State subscription: "Charge from Grid" switch
 // -------------------------------------------------------------------------------------------------------------------
 on({ id: dpControl + 'battery_charge_from_grid_enable', change: 'ne', ack: false }, async (obj) => {
    const enable = !!obj.state.val;
-   if (debug >= 1) log(`[Trigger] Netzladen -> ${enable}`, 'info');
+   if (debug >= 1) log(`[Trigger] Charge from grid -> ${enable}`, 'info');
 
    if (!enphaseClient.email || !enphaseClient.password) {
-      log('[Fehler] Keine Credentials konfiguriert – Aktion abgebrochen', 'error');
+      log('[Error] No credentials configured -- action aborted', 'error');
       return;
    }
 
    try {
       await enphaseClient.changeChargeFromGrid(enable);
    } catch (err) {
-      log(`[Fehler] changeChargeFromGrid: ${err instanceof Error ? err.message : String(err)}`, 'error');
-      // State zurücksetzen auf den alten Wert (Fehlerfall)
+      log(`[Error] changeChargeFromGrid: ${err instanceof Error ? err.message : String(err)}`, 'error');
+      // Reset state to previous value on error
       setState(dpControl + 'battery_charge_from_grid_enable', !enable, true);
    }
 });
 
 // -------------------------------------------------------------------------------------------------------------------
-// State-Subscription: Zeitpläne manuell auslesen
+// State subscription: manually read discharge schedules
 // -------------------------------------------------------------------------------------------------------------------
 on({ id: dpControl + 'read_discharge_schedules', change: 'any', ack: false }, async (obj) => {
    if (!obj.state.val) return;
-   if (debug >= 1) log('[Trigger] Lese Entlade-Zeitpläne aus Cloud', 'info');
+   if (debug >= 1) log('[Trigger] Reading discharge schedules from cloud', 'info');
 
    if (!enphaseClient.email || !enphaseClient.password) {
-      log('[Fehler] Keine Credentials konfiguriert', 'error');
+      log('[Error] No credentials configured', 'error');
       setState(dpControl + 'read_discharge_schedules', false, true);
       return;
    }
    try {
       await enphaseClient.readDischargeSchedules();
    } catch (err) {
-      log(`[Fehler] readDischargeSchedules: ${err instanceof Error ? err.message : String(err)}`, 'error');
+      log(`[Error] readDischargeSchedules: ${err instanceof Error ? err.message : String(err)}`, 'error');
    } finally {
       setState(dpControl + 'read_discharge_schedules', false, true);
    }
 });
 
 // -------------------------------------------------------------------------------------------------------------------
-// State-Subscription: Zeitpläne manuell wiederherstellen
+// State subscription: manually restore discharge schedules
 // -------------------------------------------------------------------------------------------------------------------
 on({ id: dpControl + 'restore_discharge_schedules', change: 'any', ack: false }, async (obj) => {
    if (!obj.state.val) return;
-   if (debug >= 1) log('[Trigger] Stelle Entlade-Zeitpläne wieder her', 'info');
+   if (debug >= 1) log('[Trigger] Restoring discharge schedules', 'info');
 
    if (!enphaseClient.email || !enphaseClient.password) {
-      log('[Fehler] Keine Credentials konfiguriert', 'error');
+      log('[Error] No credentials configured', 'error');
       setState(dpControl + 'restore_discharge_schedules', false, true);
       return;
    }
    try {
       await enphaseClient.restoreDischargeSchedules();
    } catch (err) {
-      log(`[Fehler] restoreDischargeSchedules: ${err instanceof Error ? err.message : String(err)}`, 'error');
+      log(`[Error] restoreDischargeSchedules: ${err instanceof Error ? err.message : String(err)}`, 'error');
    } finally {
       setState(dpControl + 'restore_discharge_schedules', false, true);
    }
 });
 
 // -------------------------------------------------------------------------------------------------------------------
-// State-Subscription: Lade-Zeitpläne manuell auslesen
+// State subscription: manually read charge schedules
 // -------------------------------------------------------------------------------------------------------------------
 on({ id: dpControl + 'read_charge_schedules', change: 'any', ack: false }, async (obj) => {
    if (!obj.state.val) return;
-   if (debug >= 1) log('[Trigger] Lese Lade-Zeitpläne aus Cloud', 'info');
+   if (debug >= 1) log('[Trigger] Reading charge schedules from cloud', 'info');
 
    if (!enphaseClient.email || !enphaseClient.password) {
-      log('[Fehler] Keine Credentials konfiguriert', 'error');
+      log('[Error] No credentials configured', 'error');
       setState(dpControl + 'read_charge_schedules', false, true);
       return;
    }
    try {
       await enphaseClient.readChargeSchedules();
    } catch (err) {
-      log(`[Fehler] readChargeSchedules: ${err instanceof Error ? err.message : String(err)}`, 'error');
+      log(`[Error] readChargeSchedules: ${err instanceof Error ? err.message : String(err)}`, 'error');
    } finally {
       setState(dpControl + 'read_charge_schedules', false, true);
    }
 });
 
 // -------------------------------------------------------------------------------------------------------------------
-// State-Subscription: Lade-Zeitpläne manuell wiederherstellen
+// State subscription: manually restore charge schedules
 // -------------------------------------------------------------------------------------------------------------------
 on({ id: dpControl + 'restore_charge_schedules', change: 'any', ack: false }, async (obj) => {
    if (!obj.state.val) return;
-   if (debug >= 1) log('[Trigger] Stelle Lade-Zeitpläne wieder her', 'info');
+   if (debug >= 1) log('[Trigger] Restoring charge schedules', 'info');
 
    if (!enphaseClient.email || !enphaseClient.password) {
-      log('[Fehler] Keine Credentials konfiguriert', 'error');
+      log('[Error] No credentials configured', 'error');
       setState(dpControl + 'restore_charge_schedules', false, true);
       return;
    }
    try {
       await enphaseClient.restoreChargeSchedules();
    } catch (err) {
-      log(`[Fehler] restoreChargeSchedules: ${err instanceof Error ? err.message : String(err)}`, 'error');
+      log(`[Error] restoreChargeSchedules: ${err instanceof Error ? err.message : String(err)}`, 'error');
    } finally {
       setState(dpControl + 'restore_charge_schedules', false, true);
    }
@@ -1766,17 +1865,17 @@ on({ id: dpControl + 'restore_charge_schedules', change: 'any', ack: false }, as
 
 on({ id: dpControl + 'delete_discharge_schedules', change: 'any', ack: false }, async (obj) => {
    if (!obj.state.val) return;
-   if (debug >= 1) log('[Trigger] Lösche alle Entlade-Zeitpläne in der Cloud', 'info');
+   if (debug >= 1) log('[Trigger] Deleting all discharge schedules in cloud', 'info');
 
    if (!enphaseClient.email || !enphaseClient.password) {
-      log('[Fehler] Keine Credentials konfiguriert', 'error');
+      log('[Error] No credentials configured', 'error');
       setState(dpControl + 'delete_discharge_schedules', false, true);
       return;
    }
    try {
       await enphaseClient.deleteDischargeSchedules();
    } catch (err) {
-      log(`[Fehler] deleteDischargeSchedules: ${err instanceof Error ? err.message : String(err)}`, 'error');
+      log(`[Error] deleteDischargeSchedules: ${err instanceof Error ? err.message : String(err)}`, 'error');
    } finally {
       setState(dpControl + 'delete_discharge_schedules', false, true);
    }
@@ -1784,46 +1883,46 @@ on({ id: dpControl + 'delete_discharge_schedules', change: 'any', ack: false }, 
 
 on({ id: dpControl + 'delete_charge_schedules', change: 'any', ack: false }, async (obj) => {
    if (!obj.state.val) return;
-   if (debug >= 1) log('[Trigger] Lösche alle Lade-Zeitpläne in der Cloud', 'info');
+   if (debug >= 1) log('[Trigger] Deleting all charge schedules in cloud', 'info');
 
    if (!enphaseClient.email || !enphaseClient.password) {
-      log('[Fehler] Keine Credentials konfiguriert', 'error');
+      log('[Error] No credentials configured', 'error');
       setState(dpControl + 'delete_charge_schedules', false, true);
       return;
    }
    try {
       await enphaseClient.deleteChargeSchedules();
    } catch (err) {
-      log(`[Fehler] deleteChargeSchedules: ${err instanceof Error ? err.message : String(err)}`, 'error');
+      log(`[Error] deleteChargeSchedules: ${err instanceof Error ? err.message : String(err)}`, 'error');
    } finally {
       setState(dpControl + 'delete_charge_schedules', false, true);
    }
 });
 
 // -------------------------------------------------------------------------------------------------------------------
-// Auto-Acknowledge für Schedule-Datenpunkte
-// Wenn Benutzer einen Schedule-Wert manuell im ioBroker bearbeitet, wird der neue Wert
-// sofort mit ack=true bestätigt. Ohne diese Subscription zeigt das ioBroker-Admin-Frontend
-// weiterhin den letzten bestätigten Wert (ack=true) und ignoriert die unbestätigte Änderung.
-// Prefix: dpBase + 'schedules.' erfasst sowohl schedules.discharge.* als auch schedules.charge.*
+// Auto-acknowledge for schedule datapoints
+// When the user manually edits a schedule value in ioBroker admin, the new value is
+// immediately confirmed with ack=true. Without this subscription, the ioBroker admin
+// frontend keeps showing the last acknowledged value and ignores the unacknowledged change.
+// Prefix: dpBase + 'schedules.' covers both schedules.discharge.* and schedules.charge.*
 // -------------------------------------------------------------------------------------------------------------------
 on({ id: new RegExp('^' + dpBase.replace(/\./g, '\\.') + 'schedules\\.'), change: 'any', ack: false }, (obj) => {
    if (obj.id && obj.state) setState(obj.id, obj.state.val, true);
 });
 
 // -------------------------------------------------------------------------------------------------------------------
-// Tägliche Token-Erneuerung
+// Daily token renewal
 // -------------------------------------------------------------------------------------------------------------------
 schedule('0 3 * * *', async () => {
-   if (debug >= 1) log('[Schedule] Tägliche Token-Überprüfung', 'info');
+   if (debug >= 1) log('[Schedule] Daily token check', 'info');
    if (!enphaseClient.checkToken()) {
       try {
          await enphaseClient.login();
       } catch (err) {
-         log(`[Schedule] Token-Erneuerung fehlgeschlagen: ${err instanceof Error ? err.message : String(err)}`, 'error');
+         log(`[Schedule] Token renewal failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
       }
    }
 });
 
-if (debug >= 0) log('[Init] Enphase Battery Control Script gestartet ✓', 'info');
-if (debug >= 0) log(`[Init] Schalter-Datenpunkt: ${dpControl}battery_discharge_restrict`, 'info');
+if (debug >= 1) log('[Init] Enphase Battery Control script started', 'info');
+if (debug >= 1) log(`[Init] Control datapoint: ${dpControl}battery_discharge_restrict`, 'info');
