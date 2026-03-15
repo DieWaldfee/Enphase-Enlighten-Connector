@@ -217,7 +217,4 @@ AI assisted with porting the original Python authentication logic to JavaScript,
 ---
 
 ## License
-
-MIT License
-
-Based on: [chinedu40/hacs_enphase_envoy_cloud](https://github.com/chinedu40/hacs_enphase_envoy_cloud)
+GPL-3.0 license
