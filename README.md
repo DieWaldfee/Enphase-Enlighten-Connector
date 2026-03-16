@@ -2,7 +2,7 @@
 
 Control Enphase battery storage systems via the Enphase Enlighten Cloud API — directly from ioBroker, without a local Envoy connection.
 
-> **Note:** This script was developed with the assistance of AI (Claude by Anthropic).
+> **Note:** This script was developed with the assistance of AI.
 
 ---
 
