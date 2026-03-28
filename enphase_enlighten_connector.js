@@ -356,11 +356,16 @@ class EnphaseCloudClient {
                'X-Requested-With': 'XMLHttpRequest',
             },
          });
+         const rawBody = await response.text();
          if (!response.ok) {
-            const errorBody = await response.text();
-            throw new Error(`JWT retrieval failed: HTTP ${response.status} -- ${errorBody}`);
+            throw new Error(`JWT retrieval failed: HTTP ${response.status} -- ${rawBody.substring(0, 300)}`);
          }
-         const data = await response.json();
+         let data;
+         try {
+            data = JSON.parse(rawBody);
+         } catch (jsonErr) {
+            throw new Error(`JWT fallback: server returned non-JSON (HTTP ${response.status}) -- ${rawBody.substring(0, 150)}`);
+         }
          token = data.token || null;
          if (!token) throw new Error('JWT token not present in server response');
          if (debug >= 1) log('[getJwtToken] JWT received via auth_ms_enho', 'info');
